@@ -1,0 +1,308 @@
+#include <stdlib.h>
+#include "adp/adp_reverse.h"
+#include "adp/adp_base.h"
+#include "global.h"
+#include "ap_global.h"
+#include "udo.h"
+#include "shm_base.h"
+#include <sys/types.h>
+#include <sys/time.h>
+#include "log.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+typedef struct _RevRecord
+{
+   char  m_AgDate[9];    /* 插入记录时的日期 YYYYMMDD                   */
+   int   m_AgSerial;     /* 平台流水号                                  */
+   int   m_RevSerial;    /* 冲正流水号                                  */
+   char  m_Trancode[21]; /* 主机交易码                                  */
+   char  m_RetCode[41];  /* 主机返回码                                  */
+   int   m_ChnNodeId;    /* 渠道节点号                                  */
+   int   m_HostNodeId;   /* 主机节点号                                  */
+   int   m_SvcId;        /* 服务号                                      */
+   int   m_SubSeq;       /* 内部子服务序号                              */
+   int   m_SubId;        /* 冲正子服务号                                */
+   int   m_MaxRetryTimes;/* 最大重试次数, 如果只需要同步冲正, 设置为 0  */
+   int   m_DelayTime;    /* 两次重试之间的最小间隔时间(s)               */
+   int   m_RetryTimes;   /* 已经重试次数                                */
+   char  m_SuccFlag;     /* 是否成功标志, 1-成功, 0-不成功              */
+   int   m_LastRevTime;  /* 上次重试时间, 直接是 time_t 类型            */
+   int   m_UdoLen;       /* UDO字符串长度                               */
+   char  m_UdoStr[2001]; /* 待冲正报文 udo 字符串                       */
+} RevRecord;
+EXEC SQL END   DECLARE SECTION;
+
+/**
+  * 取平台冲正流水号和日期
+  */
+extern void getSystemSerialAndDate( long *oplSerial, char *opcDate );
+
+int ADP_SearchSubService( const void *p1, const void *p2 )
+{
+   SubService *pstL = (SubService *)p1;
+   SubService *pstR = (SubService *)p2;
+
+   return pstL->iSubId - pstR->iSubId;
+}
+
+int ADP_SearchNodeTranCfg( const void *p1, const void *p2 )
+{
+   NodeTranCfg *pstL = (NodeTranCfg *)p1;
+   NodeTranCfg *pstR = (NodeTranCfg *)p2;
+
+   return pstL->iNodeId - pstR->iNodeId;
+}
+
+int ADP_SearchSvcCfg( const void *p1, const void *p2 )
+{
+   ServiceCfg *pstL = (ServiceCfg*)p1;
+   ServiceCfg *pstR = (ServiceCfg*)p2;
+
+   if( pstL->iSvcId != pstR->iSvcId )
+   {
+      return pstL->iSvcId - pstR->iSvcId;
+   }
+   return pstL->iSubSeq - pstR->iSubSeq;
+}
+
+int ADP_SaveDataToDb( RevRecord *epstRevRecord )
+{
+   time_t tNow;
+   EXEC SQL BEGIN DECLARE SECTION;
+   RevRecord stRevRecord;
+   EXEC SQL END DECLARE SECTION;
+   
+   memset( &stRevRecord, 0, sizeof(stRevRecord) );
+   memcpy( &stRevRecord, epstRevRecord, sizeof(stRevRecord) );
+
+   /*
+   EXEC SQL insert into ballog values (:stRevRecord);
+   */
+   EXEC SQL insert into ballog values (:stRevRecord.m_AgDate,
+                                       :stRevRecord.m_AgSerial,
+                                       :stRevRecord.m_RevSerial,
+                                       :stRevRecord.m_Trancode,
+                                       :stRevRecord.m_RetCode,
+                                       :stRevRecord.m_ChnNodeId,
+                                       :stRevRecord.m_HostNodeId,
+                                       :stRevRecord.m_SvcId,
+                                       :stRevRecord.m_SubSeq,
+                                       :stRevRecord.m_SubId,
+                                       :stRevRecord.m_MaxRetryTimes,
+                                       :stRevRecord.m_DelayTime,
+                                       :stRevRecord.m_RetryTimes,
+                                       :stRevRecord.m_SuccFlag,
+                                       :stRevRecord.m_LastRevTime,
+                                       :stRevRecord.m_UdoLen,
+                                       :stRevRecord.m_UdoStr );
+   if( SQLCODE )
+   {
+      LOG4C ((LOG_FATAL,  "insert into ballog error, sqlcode[%d]", SQLCODE));
+      return -1;
+   }
+
+   EXEC SQL COMMIT WORK;
+   return 0;
+}
+
+/**
+  * 要求必须有 REVERSE_LOG 环境变量
+  */
+/****
+static int iCount = 0;
+void ADP_SaveDataToFile( RevRecord *epstRevRecord )
+{
+   TDB_CONTEXT *tdb;
+   TDB_DATA stKey, stData;
+   char aczKeyBuf[30];
+   time_t tNow;
+
+   char *pczErrMsg = 0, *pczLog;
+   char aczSqlStm[5192];
+   int rc;
+
+   pczLog = getenv( "REVERSE_LOG" );
+   if( pczLog == NULL )
+   {
+      return;
+   }
+
+   tdb = tdb_open( pczLog, 0, 0, O_RDWR, 0600);
+   if( tdb == NULL )
+   {
+      tdb = tdb_open( pczLog, 0, 0, O_RDWR|O_CREAT, 0600);
+   }
+
+   if( tdb == NULL )
+   {
+      LOG4C (( LOG_FATAL, "打开日志数据库错"));
+      return;
+   }
+
+   time( &tNow );
+   sprintf( aczKeyBuf, "%010d%010d%05d", getpid(), (int)tNow, iCount );
+   iCount++;
+
+   stKey.dptr = aczKeyBuf;
+   stKey.dsize = strlen(aczKeyBuf)+1;
+
+   stData.dptr = (char *)epstRevRecord;
+   stData.dsize = sizeof(RevRecord)-4097+epstRevRecord->m_UdoLen+1;
+
+   rc = tdb_store( tdb, stKey, stData, TDB_INSERT );
+   if( rc != 0 )
+   {
+      LOG4C ((LOG_FATAL, "insert reverse log error: %s",tdb_errorstr(tdb)));
+   }
+
+   tdb_close( tdb );
+}
+****/
+
+int InsertBallog (int eiSubSvcId, int eiSubSvcSeq,
+                  char * epczTranCode, SVC_Content *epstService, 
+                  UDP epfUdo) 
+{
+   int  iRet, iBufLen, iRowNum;
+   SubService  stSubService;
+   char aczAgSerial[9];
+   long lSerial;
+   NodeTranCfg *pstNodeTranCfg, *pstNodeSearch, stNodeKey;
+   SubService  *pstSubService, *pstSubSearch, stSubKey;
+   ServiceCfg  *pstServiceCfg, *pstSearchCfg, stSvcCfgKey;
+   RevRecord stRevRecord;
+   long  lSer;
+
+   memset( &stRevRecord, 0, sizeof(stRevRecord) );
+
+   getString( "agserial", aczAgSerial );
+   lSerial = atol(aczAgSerial);
+   /**
+     * 根据 subid 查找到 SubService
+     * 前面已经运行过该子服务, 所有查找都不用判断失败
+     */
+  
+   /*** 传进来的eiSubSvcId 就是相应的冲正子服务subid 为何还要查找? **
+   stSvcCfgKey.iSvcId = epstService->iSvcId;
+   stSvcCfgKey.iSubSeq = eiSubSvcSeq;
+   pstServiceCfg = (ServiceCfg*)SHM_ReadData( pcShmAddr,
+                                              SERVICECFG, &iRowNum );
+   pstSearchCfg = (ServiceCfg*)bsearch( &stSvcCfgKey, pstServiceCfg, iRowNum,
+                                        sizeof(stSvcCfgKey), ADP_SearchSvcCfg );
+
+   stSubKey.iSubId = pstSearchCfg->iErrSubId;
+   *******/
+   stSubKey.iSubId = eiSubSvcId;
+   /******modi end ***/
+
+   pstSubService = (SubService*)SHM_ReadData( pcShmAddr,
+                                              SUBSERVICE, &iRowNum );
+
+   pstSubSearch = (SubService *)bsearch( &stSubKey, pstSubService, iRowNum,
+                           sizeof(stSubKey), ADP_SearchSubService );
+
+   stNodeKey.iNodeId = pstSubSearch->iNodeId;
+   pstNodeTranCfg = (NodeTranCfg*)SHM_ReadData( pcShmAddr,
+                                                NODETRANCFG, &iRowNum );
+   pstNodeSearch = (NodeTranCfg*)bsearch( &stNodeKey, pstNodeTranCfg, iRowNum,
+                            sizeof(stNodeKey), ADP_SearchNodeTranCfg );
+
+   /* getSystemSerialAndDate( (long*)&lSer, stRevRecord.m_AgDate ); */
+   getString( "agtxdate", stRevRecord.m_AgDate );
+   /*TOOL_GetSystemYYYYMMDD (stRevRecord.m_AgDate);*/
+   stRevRecord.m_AgSerial = (int)lSerial;
+   stRevRecord.m_RevSerial = (int)lSer;
+   strcpy( stRevRecord.m_Trancode, epczTranCode );
+   strcpy( stRevRecord.m_RetCode,  "" );
+   stRevRecord.m_ChnNodeId     = epstService->iChannelId;
+   stRevRecord.m_HostNodeId    = pstNodeSearch->iNodeId;
+   stRevRecord.m_SvcId         = epstService->iSvcId;
+   stRevRecord.m_SubSeq        = eiSubSvcSeq;
+   stRevRecord.m_SubId         = eiSubSvcId;
+   stRevRecord.m_MaxRetryTimes = pstNodeSearch->iMaxRetryTime;
+   stRevRecord.m_DelayTime     = pstNodeSearch->iDelayTime;
+   stRevRecord.m_RetryTimes    = 0;
+   stRevRecord.m_SuccFlag      = '0';     /** 设置为未成功 **/
+   stRevRecord.m_LastRevTime   = 0;
+   UDO_sprintf( epfUdo, stRevRecord.m_UdoStr, &stRevRecord.m_UdoLen );
+
+   /***
+   ADP_SaveDataToFile( &stRevRecord );
+   ****/
+
+   iRet = ADP_SaveDataToDb( &stRevRecord );
+   if( iRet != 0 )
+   {
+      LOG4C ((LOG_FATAL, "插入冲正记录失败"));
+      return -1;
+   }
+
+   return 0;
+}
+
+/****************************************************
+功能: 根据iErrorHandleType进行错误处理
+      SUB_ERR_TRANLOG 组织冲正记录, 写入冲正表
+输入: int            eiSubSvcId        子服务号
+      int            eiSubSeq          子服务内部序号
+      UDP            epfSubSvcReq      子服务请求信息
+      UDP            opfSubSvcRsp      子服务响应信息
+      SVC_Content    *epstService
+输出: 无
+返回: int 0-成功  其他-失败
+****************************************************/
+int  ADP_WriteBalLog( int eiSubSvcId,
+                      int eiSubSeq,
+                      UDP epfSubSvcReq,
+                      UDP opfSubSvcRsp,
+                      SVC_Content *epstService )
+{
+   int  iRet;
+   char aczStatement[1024];
+   int iRowNum, iTemp, iNodeId;
+   NodeTranCfg stNodeTranCfg;
+   SubService stSubService;
+   char aczTranCode [20 + 1];
+   
+   assert( epfSubSvcReq  != NULL );
+   assert( epstService   != NULL );
+   assert( epstService != NULL );
+
+   strcpy( aczTranCode, epstService->pstSubSvcCurr->aczTranCode );
+   
+/**********
+   switch( epstService->pstSubSvcCurr->iErrorHandleType )
+   {
+   case SUB_ERR_BALANCE:
+   case SUB_ERR_TRANLOG:
+      iRet = InsertBallog (eiSubSvcId, eiSubSeq, aczTranCode, epstService, 
+                           epfSubSvcReq); 
+      if (iRet != 0) {
+          return iRet;
+      }
+      break;
+   default:
+      sprintf( epstService->aczErrorMessage, 
+               "%d in %s 错误的iErrorHandleType[%d]",
+               __LINE__, __FILE__, 
+               epstService->pstSubSvcCurr->iErrorHandleType );
+      LOG4C (( LOG_FATAL, "错误的iErrorHandleType[%d]",
+                epstService->pstSubSvcCurr->iErrorHandleType));
+      return ADP_HANDLE_TYPE_ERR;
+   }
+****************************/
+
+      iRet = InsertBallog (eiSubSvcId, eiSubSeq, aczTranCode, epstService, 
+                           epfSubSvcReq); 
+      if (iRet != 0) {
+          return iRet;
+      }
+/***** modi end ******/
+   return 0;
+}
+
+/**
+  * end of file
+  */

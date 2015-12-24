@@ -1,0 +1,210 @@
+/********************************************************************
+**   发往银行服务主机－适配器
+**
+**   文    件: adp_tounion.c
+**   功    能: 完成与银行主机的通讯
+*********************************************************************/
+
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "udo.h"
+#include "log.h"
+#include "easysock.h"
+#include "adp/adp_base.h"
+#include "pkg/pkg_api.h"
+#include "adp_toallinpay.h"
+
+
+#define _PACK_MAC_ADD_SPACES_(epfReqList,eiFieldId, MACBUF, MACLen)\
+{\
+	char szTmp[100+1]; \
+	int nLen=0; \
+	memset(szTmp, 0, sizeof(szTmp)); \
+    UDO_GetField( epfReqList, eiFieldId, 0, szTmp, &nLen );	\
+    if(nLen > 0) \
+    { \
+    	memcpy(MACBUF+MACLen, szTmp, nLen); \
+    	MACLen += nLen; \
+    	memcpy(MACBUF+MACLen, " ", 1); \
+    	MACLen++; \
+    } \
+}   
+
+
+#define _PACK_MAC_ADD_LEN_VALUE_SPACES_(epfReqList,eiFieldId, MACBUF, MACLen)\
+{\
+	char szTmp[100+1]; \
+	int nLen=0; \
+	memset(szTmp, 0, sizeof(szTmp)); \
+    UDO_GetField( epfReqList, eiFieldId, 0, szTmp, &nLen );	\
+    if(nLen > 0) \
+    { \
+    	sprintf(MACBUF+MACLen, "%02d%s", nLen, szTmp); \
+    	MACLen += 2; \
+    	MACLen += nLen; \
+    	memcpy(MACBUF+MACLen, " ", 1); \
+    	MACLen++; \
+    } \
+}   
+
+	
+
+
+/*计算MAC*/
+int GenAllinpayMac(UDP epfReqList, char *pszOutBuffer, int nOutBufferLen)
+{
+	char szMacBuffer[1024+1];
+	int nMacLen=0;
+	char aczMacKey[32+1];	
+    char *p=NULL;
+	char aczMac[16+1];
+
+	memset(szMacBuffer, 0, sizeof(szMacBuffer));
+	nMacLen = 0;
+
+	
+	_PACK_MAC_ADD_SPACES_(epfReqList, 0, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_LEN_VALUE_SPACES_(epfReqList, 2, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 3, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 4, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 7, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 11, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 18, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 25, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 28, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_LEN_VALUE_SPACES_(epfReqList, 32, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_LEN_VALUE_SPACES_(epfReqList, 33, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 38, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 39, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 41, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 42, szMacBuffer, nMacLen);
+	_PACK_MAC_ADD_SPACES_(epfReqList, 90, szMacBuffer, nMacLen);
+
+	nMacLen --;
+	
+
+    p = getenv("MAC_KEY");	  
+    memset(aczMacKey, 0, sizeof(aczMacKey));
+	TOOL_ConvertAscii2BCD(p, aczMacKey, 16);
+	memset(aczMac, 0, sizeof(aczMac));
+
+	CalcMAC_X99 (aczMac, szMacBuffer, nMacLen, aczMacKey);
+    TOOL_ConvertBCD2Ascii(aczMac,8,pszOutBuffer+nOutBufferLen-8);
+	return 0;
+}
+
+
+/*
+**说明:本函数用于往柜台渠道发正确响应
+**渠道返回适配器基本步骤:
+**
+**1 准备打包需要的数据,包含打包的函数ID,配置的交易代码等信息,
+**  一般调用 ADP_GetChanPkgNeedInfo
+**
+**2 根据交易代码和报文标志查找该交易的报文字段配置信息,
+**  一般调用 PKG_GetInfoByTranCode
+**
+**3 调用打包函数打包
+**  一般调用 PKG_ToMsg
+**
+**4 调用渠道返回函数, 将数据返回到渠道
+**  一般调用 COM_SendBuffer
+*/
+int  ADP_ToAllinpay( int eiSubID,    int eiSubSeq,
+                     UDP epfReqList, UDP opfRspList,
+                     SVC_Content   * epstService )
+{
+    char aczSendBuf[5000];
+    int iRet, iLstId, iSendLen;
+    PkgNeedInfo stPkgNeedInfo;
+    MsgFldCfgAry stMsgFldCfgAry;
+    SUB_SvcList *pstSubSvcCfg;
+    char aczHostNodeId[10];
+    char *pTmp1, *pTmp2;
+    int iAsmRetCodeFlag=0;
+    int iChanNodeId;
+    int iToMidTranCodeId, iToMsgTranCodeId, iToMidId, iToMsgId;
+    unsigned char aczBitMap[17];
+
+    iChanNodeId = epstService->iChannelId;
+
+    iLstId = epstService->pstSubSvcCurr->iLstId;
+    /*iLstId =2;*/
+    pstSubSvcCfg = epstService->pstSubSvcCurr;
+
+    iRet = ADP_GetChanPkgNeedInfo(epstService->iSvcId, eiSubID, &stPkgNeedInfo);
+    if( iRet != 0 )
+    {
+        sprintf( epstService->aczErrorMessage,
+                 "%d in %s get the package need information error %d",
+                 __LINE__, __FILE__, iRet );
+        LOG4C(( LOG_FATAL, "get the package need information error %d", iRet ));
+        return ADP_GPNI_ERR;
+    }
+    memset( &stMsgFldCfgAry, 0x00, sizeof(stMsgFldCfgAry) );
+    iRet = PKG_GetInfoByTranCode( epstService->iChannelId,
+                                  stPkgNeedInfo.aczTranCode, iLstId,
+                                  &stMsgFldCfgAry );
+    if( iRet != 0 )
+    {
+        sprintf( epstService->aczErrorMessage,
+                 "取报文%d域配置出错",
+                 stPkgNeedInfo.iPkgAppId );
+        LOG4C(( LOG_FATAL, epstService->aczErrorMessage ));
+
+        return ADP_GIFMFC_ERR;
+    }
+
+    iRet = PKG_GetFunId( iChanNodeId, &iToMidTranCodeId, &iToMsgTranCodeId,
+                         &iToMidId, &iToMsgId );
+    if( iRet != 0 )
+    {
+        sprintf( epstService->aczErrorMessage, "%d取报文组包函数域配置出错", iChanNodeId );
+        LOG4C(( LOG_FATAL, epstService->aczErrorMessage ));
+        return ADP_GIFMFC_ERR;
+    }
+
+	LOG4C(( LOG_DEBUG,"PKG_ToMsg"));
+
+    memset( aczSendBuf, 0, sizeof(aczSendBuf) );
+    iRet = PKG_ToMsg( iToMsgId, aczSendBuf, &iSendLen,
+                      stPkgNeedInfo.iNodeId, stPkgNeedInfo.aczTranCode,
+                      iLstId, &stMsgFldCfgAry, epfReqList );
+    free( stMsgFldCfgAry.pstMsgFldCfg );
+    if( iRet != 0 )
+    {
+        sprintf( epstService->aczErrorMessage,
+                 "%d in %s子服务%d打包出错,交易代码%s,返回%d",
+                 __LINE__, __FILE__, eiSubID, stPkgNeedInfo.aczTranCode, iRet );
+        LOG4C(( LOG_FATAL, epstService->aczErrorMessage ));
+
+        return ADP_PKGTOMSG_ERR;
+    }
+
+	LOG4C(( LOG_DEBUG,"PKG_ToMsg22222222"));	
+
+    memset( aczBitMap, 0, sizeof(aczBitMap) );
+    UDO_GetField( epfReqList, 1, 0, aczBitMap, 0 );
+
+    LOG4C(( LOG_DEBUG,"BITMAP [%02X %02X %02X %02X %02X %02X %02X %02X]",
+            aczBitMap[0]&0xff, aczBitMap[1]&0xff, aczBitMap[2]&0xff,aczBitMap[3]&0xff,
+            aczBitMap[4]&0xff, aczBitMap[5]&0xff, aczBitMap[6]&0xff,aczBitMap[7]&0xff ));
+
+
+	/*计算MAC*/
+	if( aczBitMap[15] & 0x01 )
+	{	
+		GenAllinpayMac(epfReqList, aczSendBuf, iSendLen);
+    }
+	
+    if( sendBuffer( aczSendBuf, iSendLen ) == -1 )
+    {
+        LOG4C(( LOG_FATAL, "往渠道返回信息出错%s", strerror(errno) ));
+        return -1;
+    }
+    return 0;
+}
+
+

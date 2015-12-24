@@ -1,0 +1,224 @@
+/**
+  * 自动冲正基本函数
+  */
+#include <assert.h>
+
+#include "log.h"
+#include "shm_base.h"
+#include "global.h"
+
+EXEC SQL include sqlca;
+EXEC SQL include "reverse/rev_fun.h";
+
+NodeCommCfg * REV_SearchNodeCommCfgBySubId( int iSubId )
+{
+   NodeCommCfg *pstTmp;
+   SubService  *pstSubService;
+   int i, iRowNum;
+
+   pstSubService = (SubService*)SHM_ReadData(pcShmAddr, SUBSERVICE, &iRowNum );
+   if( pstSubService == NULL )
+   {
+      LOG4C(( LOG_FATAL, "取子服务 %d 配置失败 SHM_ReadData 返回 NULL",
+              iSubId ));
+      return NULL;
+   }
+   for( i = 0; i < iRowNum; i++ )
+   {
+      if( pstSubService->iSubId == iSubId )
+      {
+         break;
+      }
+      pstSubService++;
+   }
+   if( i == iRowNum )
+   {
+      LOG4C(( LOG_FATAL, "没有找到子服务 %d 配置", iSubId ));
+      return NULL;
+   }
+
+   LOG4C(( LOG_DEBUG, "子服务 %d 所在节点 %d", iSubId, pstSubService->iNodeId ));
+   pstTmp = (NodeCommCfg *)SHM_ReadData(pcShmAddr, NODECOMMCFG, &iRowNum );
+   if( pstTmp == NULL )
+   {
+      LOG4C(( LOG_FATAL, "取节点通信配置失败 SHM_ReadData 返回 NULL" ));
+      return pstTmp;
+   }
+
+   for( i = 0; i < iRowNum; i++ )
+   {
+      if( pstTmp->iNodeId == pstSubService->iNodeId )
+      {
+         return pstTmp;
+      }
+      pstTmp++;
+   }
+
+   LOG4C(( LOG_FATAL, "没有找到节点 %d 通信配置", pstSubService->iNodeId ));
+
+   return NULL;
+}
+
+SubService * REV_SearchSubService( int eiSubId )
+{
+   NodeCommCfg *pstTmp;
+   SubService  *pstSubService;
+   int i, iRowNum;
+
+   pstSubService = (SubService*)SHM_ReadData(pcShmAddr, SUBSERVICE, &iRowNum );
+   if( pstSubService == NULL )
+   {
+      LOG4C(( LOG_FATAL, "取子服务 %d 配置失败 SHM_ReadData 返回 NULL",
+              eiSubId ));
+      return NULL;
+   }
+   for( i = 0; i < iRowNum; i++ )
+   {
+      if( pstSubService->iSubId == eiSubId )
+      {
+         return pstSubService;
+      }
+      pstSubService++;
+   }
+   if( i == iRowNum )
+   {
+      LOG4C(( LOG_FATAL, "没有找到子服务 %d 配置", eiSubId ));
+      return NULL;
+   }
+}
+
+int ADP_GetChanRet( int eiHostNodeId, int eiChanNodeId, char *epczHostCode,
+                    char *epczHostMsg, char *opczChanCode, char *opczChanMsg )
+{
+   int iRow, iTemp;
+   EXEC SQL BEGIN DECLARE SECTION;
+      int iHostNodeId, iChanNodeId;
+      char aczHostCode[100], aczHostMsg[256];
+      struct _RetCodeMap
+      {
+         int iHostNodeId;
+         int iChanNodeId;
+         char aczChanRetCode[ 20 + 1 ];
+         char aczChanRetMsg[ 20 + 1 ];
+         char aczHostRetCode[ 20 + 1 ];
+         char aczHostRetMsg[ 20 + 1 ];
+         char aczFlag[2];
+      };
+   struct _RetCodeMap stRetCodeMap;
+   EXEC SQL END DECLARE SECTION;
+
+   assert( epczHostCode != NULL );
+   assert( opczChanCode != NULL );
+
+   memset( aczHostCode, 0, sizeof(aczHostCode) );
+   memset( aczHostMsg, 0, sizeof(aczHostMsg) );
+   memset( &stRetCodeMap, 0, sizeof(stRetCodeMap) );
+
+   iHostNodeId = eiHostNodeId;
+   iChanNodeId = eiChanNodeId;
+
+   PUB_StrTrim( epczHostCode, ' ' );
+   strcpy( aczHostCode, epczHostCode );
+
+   if( epczHostMsg != NULL )
+   {
+      PUB_StrTrim( epczHostMsg, ' ' );
+      strcpy( aczHostMsg, epczHostMsg );
+   }
+
+   PUB_StrTrim( epczHostCode, ' ' );
+   if( strlen( aczHostCode ) == 0 )
+   {
+      LOG4C(( LOG_FATAL, "%d in %s 主机响应码为空" ));
+   }
+
+   if( epczHostMsg != NULL )
+   {
+      PUB_StrTrim( epczHostMsg, ' ' );
+      strcpy( aczHostMsg, epczHostMsg );
+   }
+
+   if( epczHostMsg == NULL )
+   {
+      /*EXEC SQL select first 1 * into :stRetCodeMap from retcodemap*/
+      EXEC SQL select * into :stRetCodeMap from retcodemap
+               where hostnodeid=:iHostNodeId and
+                     channodeid=:iChanNodeId and
+                     hostretcode=:aczHostCode and rownum=1;
+   }
+   else
+   {
+      /*EXEC SQL select first 1 * into :stRetCodeMap from retcodemap*/
+      EXEC SQL select * into :stRetCodeMap from retcodemap
+               where hostnodeid=:iHostNodeId and
+                     channodeid=:iChanNodeId and
+                     hostretcode=:aczHostCode and
+                     hostretmsg=:aczHostMsg and rownum=1;
+   }
+
+   if( sqlca.sqlcode!=0 && sqlca.sqlcode!=DATANOTFOUND )
+   {
+      LOG4C(( LOG_FATAL, "数据库错误.[%d] 主机编号[%d], 渠道编号[%d],主机响应码[%s]",
+              sqlca.sqlcode, iHostNodeId, iChanNodeId, aczHostCode ));
+      strcpy( opczChanCode, "200001" );
+      if( opczChanMsg != NULL )
+      {
+         strcpy( opczChanMsg, "应用服务系统错误" );
+      }
+      return -1;
+   }
+   else if( sqlca.sqlcode == DATANOTFOUND ) /*找不到对应记录*/
+   {
+      LOG4C(( LOG_FATAL, "找不到对应记录,添加错误对照记录.[%d] 主机编号[%d]"
+              ", 渠道编号[%d],主机响应码[%s]", sqlca.sqlcode, 
+              iHostNodeId, iChanNodeId, aczHostCode ));
+      memset( &stRetCodeMap, 0, sizeof(stRetCodeMap) );
+      stRetCodeMap.iHostNodeId = iHostNodeId;
+      stRetCodeMap.iChanNodeId = iChanNodeId;
+      strcpy( stRetCodeMap.aczHostRetCode, aczHostCode );
+      strcpy( stRetCodeMap.aczHostRetMsg, aczHostMsg );
+      strcpy( stRetCodeMap.aczFlag, "1" );   /*需要维护*/
+
+      /*EXEC SQL begin work;*/
+      EXEC SQL insert into retcodemap values (:stRetCodeMap);
+      if( sqlca.sqlcode!=0 )
+      {
+         strcpy( opczChanCode, "200001" );
+         if( opczChanMsg != NULL )
+         {
+            strcpy( opczChanMsg, "应用服务系统错误" );
+         }
+         LOG4C(( LOG_FATAL, "数据库错误.[%d] 主机编号[%d], 渠道编号[%d], "
+                 "主机响应码[%s], 主机响应信息[%s]",
+                 sqlca.sqlcode, 
+                 iHostNodeId, iChanNodeId, aczHostCode, aczHostMsg ));
+         EXEC SQL rollback work;
+         return -1;
+      }
+      EXEC SQL commit work;
+
+      /*返回主机响应码和响应信息*/
+
+      return 1;
+   }
+   else /*找到对应记录*/
+   {
+      /*未维护*/
+      if( stRetCodeMap.aczFlag[0] == '1' )
+      {
+         return 1;
+      }
+      PUB_StrRightTrim( stRetCodeMap.aczChanRetCode, ' ' );
+      PUB_StrRightTrim( stRetCodeMap.aczChanRetMsg, ' ' );
+      strcpy( opczChanCode, stRetCodeMap.aczChanRetCode );
+      if( opczChanMsg != NULL )
+      {
+         strcpy( opczChanMsg, stRetCodeMap.aczChanRetMsg );
+      }
+      return 0;
+   }
+}
+
+/**
+  * 文件结束
+  */

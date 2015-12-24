@@ -1,0 +1,313 @@
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/shm.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <signal.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+
+#include "reverse/rev_var.h"
+#include "shm_base.h"
+#include "global.h"
+#include "log.h"
+#include "apr.h"
+#include "apr_general.h"
+
+EXEC SQL include SQLCA;
+
+EXEC SQL include "reverse/rev_fun.h";
+/**
+  * 最多处理 5000 条待冲正记录
+  */
+
+EXEC SQL BEGIN DECLARE SECTION;
+RevRecord gstRevRecord[5000];
+RevRecordInd gstRevRecordInd[5000];
+EXEC SQL END DECLARE SECTION;
+
+char *pcShmAddr = NULL;
+int giCount;
+int iShmKey;
+static int sleeptime=60;
+
+void doExit( int sig )
+{
+   /** 设置为退出 **/
+   iContinue = 0;
+}
+
+extern int REV_RunFunction( RevRecord *pstRevRecord );
+
+/**
+  * 根据主机节点号调用主机冲正适配器
+  * 主机冲正适配器函数
+  */
+void doReverseFunction( RevRecord *pstRevRecord, int iRevPos )
+{
+   int iShmKeyCurr, iResult;
+   int iRet;
+   time_t tNow;
+   EXEC SQL BEGIN DECLARE SECTION;
+   char aczStatement[1024];
+   EXEC SQL END DECLARE SECTION;
+
+   pcShmAddr = Shm_GetCfgShm( iShmKey, &iShmKeyCurr );
+   if( pcShmAddr == NULL )
+   {
+      LOG4C(( LOG_FATAL, "Get Config Share Memory error" ));
+      return;
+   }
+
+   LOG4C(( LOG_DEBUG, "Config share memory, Key is [%d]", iShmKeyCurr ));
+
+   iResult = REV_RunFunction( pstRevRecord );
+
+   time( &tNow );
+   /**
+     * 执行冲正函数后打开数据库必须成功
+     * 此处检查只是为了逻辑上, 前面已经打开数据库成功, 此处不会失败
+     */
+   if( DataBaseConnect() )
+   {
+      LOG4C(( LOG_FATAL, "打开数据库失败 !" ));
+      return;
+   }
+
+   if( iResult == 0 || iResult == 1 )
+   {
+      /**
+        * 冲正已成功, 只更新冲正成功标志
+        */
+      strcpy( pstRevRecord->m_SuccFlag, "1" );
+   }
+   else if( iResult == 2 )
+   {
+      /**
+        * 已经对账, 强行终止
+        */
+      strcpy( pstRevRecord->m_SuccFlag, "9" );
+   }
+   else
+   {
+      /**
+        * 冲正未成功, 更新冲正重试次数和当前时间
+        */
+      pstRevRecord->m_RetryTimes++;
+      pstRevRecord->m_LastRevTime = tNow;
+   }
+
+   memset( aczStatement, 0, sizeof(aczStatement) );
+   sprintf( aczStatement, "update ballog set retry_times=%d, succ_flag='%s',"
+                          "last_rev_time=%d where ag_date='%s' and ag_serial=%d and sub_seq=%d",
+                          pstRevRecord->m_RetryTimes, pstRevRecord->m_SuccFlag,
+                          pstRevRecord->m_LastRevTime, pstRevRecord->m_AgDate,
+                          pstRevRecord->m_AgSerial, pstRevRecord->m_SubSeq );
+   LOG4C(( LOG_DEBUG, "即将执行的SQL语句[%s]", aczStatement ));
+   /*EXEC SQL BEGIN WORK;*/
+   EXEC SQL PREPARE reverse_upd1 from :aczStatement;
+   if( sqlca.sqlcode )
+   {
+      LOG4C(( LOG_FATAL, "数据库操作失败 sqlcode[%d]", sqlca.sqlcode ));
+      EXEC SQL ROLLBACK WORK RELEASE;
+      return;
+   }
+   EXEC SQL EXECUTE reverse_upd1;
+   if( sqlca.sqlcode )
+   {
+      LOG4C(( LOG_FATAL, "数据库操作失败 sqlcode[%d]", sqlca.sqlcode ));
+      /*EXEC SQL FREE reverse_upd1;*/
+      EXEC SQL ROLLBACK WORK RELEASE;
+   }
+   else
+   {
+      /*EXEC SQL FREE reverse_upd1;*/
+      EXEC SQL COMMIT WORK RELEASE;
+   }
+
+
+   shmdt( pcShmAddr );
+}
+
+/**
+  * 查找所有待冲正记录
+  */
+int doReverse( )
+{
+   int iRet, iColNums, iPid, iState, iCount = 0, i;
+   time_t tNow;
+
+   for( i = 0; i < giCount; i++ )
+   {
+      tNow = time( &tNow );
+      switch( (iPid = fork()) )
+      {
+      case -1:
+         LOG4C(( LOG_DEBUG, "insuffient system resource to fork()" ));
+         sleep( sleeptime );
+         return -1;
+      case 0:   /* 子进程 */
+         doReverseFunction( &gstRevRecord[i], i );
+         exit( 0 );
+      default:  /* 父进程 */
+         /** 等待子进程结束, 后面再增加定时等待 **/
+         wait( &iState );
+      }
+   }
+
+   return 0;
+}
+
+/**
+  * 支持
+  */
+int main(int argc, char **argv)
+{
+   char *zErrMsg = 0, *pczSchdule;
+   int rc, i, iNeedReverse;
+   int nRet = 0;
+   char aczLogConfig[100];
+   char aczEnvConfig[100];
+
+   EXEC SQL BEGIN DECLARE SECTION;
+   varchar stUsername[20];
+   varchar stPassword[20];
+   long tNow;
+   char aczStatement[1024];
+   EXEC SQL END DECLARE SECTION;
+
+   char pczUsername[20];
+   char pczPassword[20];
+
+   memset( pczUsername, 0x00, sizeof(pczUsername) );
+   memset( pczPassword, 0x00, sizeof(pczPassword) );
+
+   if( argc != 3 )
+   {
+      fprintf(stderr, "Usage: %s SHMKEY PERTIME\n", argv[0]);
+      exit(1);
+   }
+
+   if( atoi(argv[2]) > 0 && atoi(argv[2]) < 3600 )
+      sleeptime = atoi(argv[2]);
+
+   signal( SIGHUP, SIG_IGN );
+   signal( SIGALRM, SIG_IGN );
+   signal( SIGTERM, SIG_IGN );
+   signal( SIGUSR1, doExit );
+   signal( SIGCLD,  SIG_IGN );
+
+   apr_initialize();
+   atexit( apr_terminate );
+
+   iShmKey = atoi(argv[1]);
+
+   sprintf( aczEnvConfig, "%s/etc/reverse.env", getenv("MYROOT") );
+   loadEnviorment( aczEnvConfig );
+   sprintf( aczLogConfig, "%s/etc/reverse.ini", getenv("MYROOT") );
+
+   switch( fork() )
+   {
+   case 0:
+      break;
+   case -1:
+      fprintf( stderr, "fork error: %s\n", strerror(errno) );
+      return;
+   default:
+      printf( "auto reverse daemon started!!\n" );
+      return 0;
+   }
+
+   if( (nRet=DataBaseConnect()) )
+   {
+      fprintf( stderr, "联接数据库失败%d\n", nRet );
+      exit(1);
+   }
+   EXEC SQL COMMIT WORK RELEASE;
+   LOG4C_INIT( aczLogConfig );
+   LOG4C_OPEN();
+   LOG4C(( LOG_DEBUG, "rev_daemon begin! sleeptime[%d]", sleeptime ));
+   /** 设置为继续 **/
+   iContinue = 1;
+
+   /** 当收到 SIGUSR1 信号时会改变该值 **/
+   while( iContinue )
+   {
+      /*LOG4C_REGETCONF();*/
+      memset( gstRevRecord, 0, sizeof(RevRecord)*5000 );
+      giCount = 0;
+
+      if( (nRet=DataBaseConnect()) )
+      {
+         LOG4C(( LOG_FATAL, "联接数据库失败%d\n", nRet ));
+         sleep( sleeptime );
+         continue;
+      }
+   
+      time( &tNow );
+      memset( aczStatement, 0, sizeof(aczStatement) );
+
+      sprintf( aczStatement, 
+               "select * from ballog where succ_flag='0' and retry_times<max_retry_times and (:v1-last_rev_time)>delay_time" );
+
+      /*EXEC SQL BEGIN WORK;*/
+   
+      EXEC SQL PREPARE s from :aczStatement;
+      if( sqlca.sqlcode )
+      {
+         LOG4C(( LOG_DEBUG, "数据库操作失败 sqlcode[%d]", sqlca.sqlcode )); 
+         EXEC SQL ROLLBACK WORK RELEASE;
+         sleep( sleeptime );
+         continue;
+      }
+   
+      EXEC SQL DECLARE reverse_cur cursor for s;
+      EXEC SQL OPEN reverse_cur USING :tNow;
+      if( sqlca.sqlcode )
+      {
+         LOG4C(( LOG_DEBUG, "数据库打开游标操作失败 sqlcode[%d]", sqlca.sqlcode ));
+         EXEC SQL ROLLBACK WORK RELEASE;
+         sleep( sleeptime );
+         continue;
+      }
+   
+      /*LOG4C(( LOG_DEBUG, "开始取待冲正记录(最多前5000条记录)" ));*/
+      for( iNeedReverse = 0; iNeedReverse < 5000; iNeedReverse++ )
+      {
+         EXEC SQL FETCH reverse_cur into :gstRevRecord[iNeedReverse] :gstRevRecordInd[iNeedReverse];
+         if( sqlca.sqlcode !=0 && sqlca.sqlcode != DATANOTFOUND )
+         {
+            LOG4C(( LOG_DEBUG, "fetch操作失败 sqlcode[%d]", sqlca.sqlcode )); 
+            break;
+         }
+         else if( sqlca.sqlcode == DATANOTFOUND )
+         {
+   	    break;
+         }
+	 giCount++;
+      }
+   
+      LOG4C(( LOG_DEBUG, "本次检查一共有 %d 条待冲正记录", iNeedReverse ));
+      /* 至此, 系统已经将待冲正的记录读出*/
+      EXEC SQL CLOSE reverse_cur;
+      EXEC SQL COMMIT WORK RELEASE;
+      if( iNeedReverse > 0 )
+      {
+          doReverse( );
+      }
+      /* 每次操作后暂停一秒 */
+      sleep( sleeptime );
+   }
+   LOG4C(( LOG_DEBUG, "rev_daemon end!" ));
+   LOG4C_CLOSE();
+   return 0;
+}
+

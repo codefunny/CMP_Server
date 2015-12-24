@@ -1,0 +1,16 @@
+#!/bin/bash
+for dirs in *
+do
+   if [ -d $dirs ]; then
+      cd $dirs
+           if [ -f mk ]; then
+                chmod +x mk
+		cd ../
+           elif [ -f mkall ]; then
+		chmod +x mkall
+                cd ../
+	   else
+		cd ../
+           fi
+   fi
+done

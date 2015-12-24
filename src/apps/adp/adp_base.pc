@@ -1,0 +1,1322 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <setjmp.h>
+#include "apr_network_io.h"
+#include "ap_global.h"
+
+#include "shm_base.h"
+#include "udo.h"
+#include "pub_base.h"
+#include "easysock.h"
+#include "adp/adp_base.h"
+#include "log.h"
+
+EXEC SQL INCLUDE sqlca;
+
+extern apr_socket_t *pstClient;
+
+extern FILE *fpRead = NULL, *fpWrite = NULL;
+extern int PKG_CfgCompare( const void *pstNode1, const void *pstNode2 );
+extern int PKG_SrchTranFld( const void *pstNode1, const void *pstNode2 );
+extern int prog( char *epczInFile, char *epczOutFile );
+
+int DataBaseDisConnect()
+{
+   EXEC SQL COMMIT WORK RELEASE;
+   if( SQLCODE != 0 )
+   {
+      printf( "close database server error, SQLCODE = [%ld]\n", sqlca.sqlcode );
+      LOG4C(( LOG_FATAL,
+              "close database server error, SQLCODE = [%ld]", sqlca.sqlcode ));
+      return -1;
+   }
+
+   /******************************FOR INFORMIX******************
+   EXEC SQL close database;
+   if( SQLCODE != 0 )
+   {
+      LOG4C(( LOG_FATAL,
+              "close database server error, SQLCODE = [%ld]", sqlca.sqlcode ));
+      return -1;
+   }
+   ******************************FOR INFORMIX******************/
+   return 0;
+}
+
+int DataBaseConnect()
+{
+   EXEC SQL BEGIN DECLARE SECTION;
+   varchar stUsername[20];
+   varchar stPassword[20];
+   varchar stDbSid[20];
+   char stDbName[20];
+   EXEC SQL END DECLARE SECTION;
+
+   char *pczUsername=NULL;
+   char *pczPassword=NULL;
+   char *pczDbSid=NULL;
+   char *pczDbname=NULL;
+
+   if( (pczUsername=(char *)getenv("DBUSER")) == NULL )
+   {
+      LOG4C(( LOG_FATAL, "请先设置环境变量DBUSER" ));
+      return -1;
+   }
+
+   if( (pczPassword=(char *)getenv("DBPASS")) == NULL )
+   {
+      LOG4C(( LOG_FATAL, "请先设置环境变量DBPASS" ));
+      return -1;
+   }
+
+   strcpy( (char *)stUsername.arr, pczUsername );
+   strcpy( (char *)stPassword.arr, pczPassword );
+   stUsername.len = strlen( pczUsername );
+   stPassword.len = strlen( pczPassword );
+
+   if( (pczDbSid=(char *)getenv("ORACLE_ADDR")) == NULL )
+   {
+      EXEC SQL CONNECT :stUsername IDENTIFIED BY :stPassword;
+   }
+   else
+   {
+      strcpy( (char *)stDbSid.arr, pczDbSid );
+      stDbSid.len   = strlen( pczDbSid );
+      EXEC SQL CONNECT :stUsername IDENTIFIED BY :stPassword USING :stDbSid;
+   }
+
+   if( SQLCODE != 0 )
+   {
+      LOG4C(( LOG_FATAL, "[ERROR]Connect to database server error, sqlca.sqlcode = [%d]", SQLCODE ));
+      return SQLCODE;
+   }
+
+   /******************************FOR INFORMIX******************
+   EXEC SQL BEGIN DECLARE SECTION;
+   char *pczDatabase;
+   EXEC SQL END DECLARE SECTION;
+
+   pczDatabase = getenv( "AGENT_DB" );
+   if( pczDatabase == NULL )
+   {
+      LOG4C(( LOG_FATAL, "please set env AGENT_DB first " ));
+      return -1;
+   }
+   sqldetach();
+   EXEC SQL database :pczDatabase;
+   if( SQLCODE != 0 )
+   {
+      LOG4C(( LOG_FATAL,
+              "connect to database server error, SQLCODE = [%d]",
+              sqlca.sqlcode ));
+      return -1;
+   }
+   ******************************FOR INFORMIX******************/
+   return 0;
+}
+
+int ADP_GetDictId( int iNodeId )
+{
+   NodeTranCfg *pstNodeTranCfg;
+   int iRow, iTemp;
+
+   pstNodeTranCfg = (NodeTranCfg*)SHM_ReadData( pcShmAddr, NODETRANCFG, &iRow);
+   for( iTemp = 0; iTemp < iRow; iTemp++ )
+   {
+      if( pstNodeTranCfg->iNodeId == iNodeId )
+      {
+         return pstNodeTranCfg->iMsgAppId;
+      }
+      pstNodeTranCfg++;
+   }
+
+   return -1;
+}
+
+/*
+**function:get the trancode,nodeid,templetid and tomidid,tomsgid
+**input:   1 subsvcid
+**output:  2 all neede information
+**return:  0-success,other-error
+*/
+int ADP_GetPkgNeedInfo( int eiSubSvcId, PkgNeedInfo *opstPkgNeedInfo )
+{
+   int iRowNum, iRowNum2, iTemp, iTemp2;
+   SubService *pstSubService = NULL;
+   NodeTranCfg *pstNodeTranCfg = NULL;
+
+   assert( opstPkgNeedInfo != NULL );
+
+   iRowNum = 0;
+   pstSubService = (SubService *)SHM_ReadData ( (void *)pcShmAddr,
+                                                SUBSERVICE, &iRowNum );
+   if( pstSubService == NULL )
+   {
+      LOG4C(( LOG_FATAL, "从共享内存读取数据失败" ));
+      return -1;
+   }
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if( (*(pstSubService+iTemp)).iSubId == eiSubSvcId )
+      {
+         break;  /*在SubService中找到指定子服务号的子服务*/
+      }
+   }
+
+   if( iTemp == iRowNum )
+   {
+      return ADP_NO_SUB_DEF;
+   }
+
+   iRowNum2 = 0;
+   pstNodeTranCfg = (NodeTranCfg *)SHM_ReadData ( (void *)pcShmAddr,
+                                                  NODETRANCFG, &iRowNum2 );
+   if( pstNodeTranCfg == NULL )
+   {
+      LOG4C(( LOG_FATAL, "从共享内存读取数据失败" ));
+      return -1;
+   }
+   for( iTemp2 = 0; iTemp2 < iRowNum2; iTemp2++ )
+   {
+      if( (*(pstNodeTranCfg+iTemp2)).iNodeId==(*(pstSubService+iTemp)).iNodeId )
+      {
+         opstPkgNeedInfo->iNodeId    = (*(pstSubService+iTemp)).iNodeId;
+         opstPkgNeedInfo->iTempletId = (*(pstSubService+iTemp)).iTempletId;
+         opstPkgNeedInfo->iToMsgId   = (*(pstNodeTranCfg+iTemp2)).iToMsgId;
+         opstPkgNeedInfo->iToMidId   = (*(pstNodeTranCfg+iTemp2)).iToMidId;
+         opstPkgNeedInfo->iPkgAppId  = (*(pstSubService+iTemp)).iMsgAppId;
+         strcpy( opstPkgNeedInfo->aczTranCode, (*(pstSubService+iTemp)).aczTranCode );
+	 return 0;
+      }
+   }
+
+   return ADP_NO_HOST_DEF;
+}
+
+int ADP_FindNodeCommCfg (int eiNodeId, NodeCommCfg *opstNodeCommCfg)
+{
+   int iRowNum, iTemp;
+   NodeCommCfg *pstNodeCommCfg;
+
+   pstNodeCommCfg = (NodeCommCfg*)SHM_ReadData( pcShmAddr, NODECOMMCFG,
+                                                &iRowNum );
+   for (iTemp = 0; iTemp < iRowNum; iTemp++)
+   {
+      if (pstNodeCommCfg->iNodeId == eiNodeId )
+      {
+         *opstNodeCommCfg = *pstNodeCommCfg;
+         return 0;
+      }
+      pstNodeCommCfg++;
+   }
+
+   return (-1);
+}
+
+/*
+**function:get the trancode,nodeid,templetid and tomidid,tomsgid
+**input:   1 svcid
+**         2 subsvcid
+**output:  1 all neede information
+**return:  0-success,other-error
+*/
+int ADP_GetChanPkgNeedInfo( int eiSvcId, int eiSubSvcId,
+                            PkgNeedInfo *opstPkgNeedInfo )
+{
+   int iRowNum, iRowNum2, iTemp, iTemp2;
+   Service *pstService = NULL;
+   NodeTranCfg *pstNodeTranCfg = NULL;
+
+   assert( opstPkgNeedInfo != NULL );
+
+   iRowNum = 0;
+   pstService = (Service *)SHM_ReadData ( (void *)pcShmAddr,
+                                          SERVICE, &iRowNum );
+   if( pstService == NULL )
+   {
+      LOG4C(( LOG_FATAL, "从共享内存读取数据失败" ));
+      return -1;
+   }
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if( (*(pstService+iTemp)).iSvcId == eiSvcId )
+      {
+         break;  /*在Service中找到指定服务号的服务*/
+      }
+   }
+
+   if( iTemp == iRowNum )
+   {
+      return ADP_NO_SUB_DEF;
+   }
+
+   iRowNum2 = 0;
+   pstNodeTranCfg = (NodeTranCfg *)SHM_ReadData ( (void *)pcShmAddr,
+                                                  NODETRANCFG, &iRowNum2 );
+   if( pstNodeTranCfg == NULL )
+   {
+      LOG4C(( LOG_FATAL, "从共享内存读取数据失败" ));
+      return -1;
+   }
+   for( iTemp2 = 0; iTemp2 < iRowNum2; iTemp2++ )
+   {
+      if( (*(pstNodeTranCfg+iTemp2)).iNodeId == (*(pstService+iTemp)).iNodeId )
+      {
+         opstPkgNeedInfo->iNodeId    = (*(pstService+iTemp)).iNodeId;
+         opstPkgNeedInfo->iToMsgId   = (*(pstNodeTranCfg+iTemp2)).iToMsgId;
+         opstPkgNeedInfo->iToMidId   = (*(pstNodeTranCfg+iTemp2)).iToMidId;
+         opstPkgNeedInfo->iPkgAppId  = (*(pstNodeTranCfg+iTemp2)).iMsgAppId;
+         strcpy( opstPkgNeedInfo->aczTranCode, (*(pstService+iTemp)).aczTranCode );
+         return 0;
+      }
+   }
+
+   return ADP_NO_HOST_DEF;
+}
+
+/*
+**功能:取主机节点号
+**输入:1 子服务序号
+**     2 服务结构信息
+**输出:1 主机节点号
+**返回   0-成功,其他-失败
+*/
+int ADP_GetHostNodeId( int eiSubSeq, SVC_Content *epstService,
+                       int *opiHostNodeId )
+{
+   SUB_SvcList * pstSubSvc;
+
+   assert( epstService != NULL );
+   assert( opiHostNodeId != NULL );
+
+   pstSubSvc = &epstService->stSubSvcHead;
+   while( pstSubSvc != NULL )
+   {
+      if( pstSubSvc->iSubSvcSeq == eiSubSeq )
+      {
+         *opiHostNodeId = pstSubSvc->iHostId;
+         return 0;
+      }
+      pstSubSvc = pstSubSvc->pstNextSubSvc;
+   }
+   *opiHostNodeId = 0;
+   return -1;
+}
+
+/*
+**功能:    根据节点号、交易码和报文方向标志生成各节点值为空的链表
+**输入参数:1 节点号
+**         2 交易码
+**         3 报文方向标志
+**输出参数:1 空链表
+**返回值   0 - 成功,-1 - 失败
+*/
+int ADP_CreateNullListByTranCode( int eiNodeId, char *epczTranCode,
+                                  int eiMsgDescrb, UDP opfList )
+{
+   int iRowNum, iTemp, iFldNum, iVal = 0;
+   int aiFlds[200], iTemp1, iFldSeq;
+   TranFldCfg *pstTranFldCfg;
+   NodeTranCfg *pstNodeTranCfg;
+   MsgFldCfg  *pstMsgFldCfg;
+   char *pTmp1, *pTmp2, aczFldNum[10];
+   short shVal = 0;
+   long lVal = 0;
+   float fVal = 0;
+   double dVal = 0;
+
+   assert( epczTranCode != NULL );
+   assert( opfList      != NULL );
+
+   pstTranFldCfg = (TranFldCfg*)SHM_ReadData( (void*)pcShmAddr,
+                                              TRANFLDCFG, &iRowNum );
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if( ( pstTranFldCfg->iNodeId == eiNodeId ) &&
+          ( eiMsgDescrb == pstTranFldCfg->iMsgDscrb ) &&
+          ( strcmp( epczTranCode, pstTranFldCfg->aczTranCode ) == 0 ) )
+      {
+         break;
+      }
+      pstTranFldCfg++;
+   }
+   if( iTemp == iRowNum || iRowNum < 0 )
+   {
+      LOG4C(( LOG_FATAL, "CreatNullListByTranCode发生错误,节点%d交易码%s",
+              eiNodeId, epczTranCode ));
+      return -1;
+   }
+
+   pTmp1 = pstTranFldCfg->aczTranFld;
+   iFldNum = 0;
+   /*下面首先根据域段组成生成一个数组*/
+   do
+   {
+      pTmp2 = strchr( pTmp1, ',' );
+      if( pTmp2 != NULL )
+      {
+         memset( aczFldNum, 0x00, sizeof( aczFldNum ) );
+         memcpy( aczFldNum, pTmp1, (int)(pTmp2 - pTmp1) );
+         iFldSeq = atoi( aczFldNum );
+         pTmp1 = pTmp2 + 1;
+         if( iFldSeq != -1 )
+         {
+            aiFlds[iFldNum] = iFldSeq;
+            iFldNum++;
+         }
+      }
+   }while( pTmp2 != NULL );
+
+   PUB_UpSort( iFldNum, aiFlds );
+
+   pstNodeTranCfg = (NodeTranCfg*)SHM_ReadData( (void*)pcShmAddr,
+                                                NODETRANCFG, &iRowNum );
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if( eiNodeId == pstNodeTranCfg->iNodeId )
+      {
+         break;
+      }
+      pstNodeTranCfg++;
+   }
+   if( iTemp == iRowNum || iRowNum < 0 )
+   {
+      LOG4C(( LOG_FATAL, "节点%d交易代码%s配置非法", eiNodeId, epczTranCode ));
+      return -1;
+   }
+   iTemp1  = 0;
+   pstMsgFldCfg = (MsgFldCfg*)SHM_ReadData( (void*)pcShmAddr,
+                                            MSGFLDCFG, &iRowNum );
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if( ( pstNodeTranCfg->iMsgAppId == pstMsgFldCfg->iMsgAppId ) &&
+          ( aiFlds[iTemp1] == pstMsgFldCfg->iFldSeq ) )
+      {
+         if( UDO_FieldExist( opfList, pstMsgFldCfg->iFldSeq ) == 0 )  /* 不存在才Add */
+         switch( pstMsgFldCfg->iFldType )
+         {
+         case UDT_BIN:
+            UDO_AddField( opfList, aiFlds[iTemp1], UDT_BIN, (char*)&shVal, 0 );
+            break;
+         case UDT_SHORT:
+            UDO_AddField( opfList, aiFlds[iTemp1], UDT_SHORT, (char*)&shVal, 0 );
+            break;
+         case UDT_INT:
+            UDO_AddField( opfList, aiFlds[iTemp1], UDT_INT, (char*)&iVal, 0 );
+            break;
+         case UDT_LONG:
+            UDO_AddField( opfList, aiFlds[iTemp1], UDT_LONG, (char*)&lVal, 0 );
+            break;
+         case UDT_FLOAT:
+            UDO_AddField( opfList, aiFlds[iTemp1], UDT_FLOAT, (char*)&fVal, 0 );
+            break;
+         case UDT_DOUBLE:
+            UDO_AddField( opfList, aiFlds[iTemp1], UDT_DOUBLE, (char*)&dVal, 0 );
+            break;
+         default:
+            UDO_AddField( opfList, aiFlds[iTemp1], UDT_STRING, (char*)" ", 0 );
+         }
+         iTemp1++;
+         if( iTemp1 == iFldNum )
+         {
+            break;
+         }
+      }
+      pstMsgFldCfg++;
+   }
+   if( iTemp == iRowNum || iRowNum < 0 )
+   {
+      LOG4C(( LOG_FATAL, "节点%d报文应用%d配置非法", eiNodeId, pstNodeTranCfg->iMsgAppId ));
+      return -1;
+   }
+   if( iTemp1 < iFldNum )
+   {
+      LOG4C(( LOG_FATAL, "节点%d报文应用%d域%d没有配置",
+              eiNodeId, pstNodeTranCfg->iMsgAppId, aiFlds[iTemp1] ));
+      return -1;
+   }
+
+   return 0;
+}
+
+/*
+**功能   根据交易码和主机节点号查找相应的服务名
+**输入 1 主机节点号
+**     2 交易代码
+**输出 1 服务名
+**返回 0-成功,其他-失败
+*/
+int ADP_FindService( int eiHostNodeId, char *epczTranCode, char *opczSvcName )
+{
+   int iRowNum, iTemp;
+   KernSvc *pstKernSvc;
+
+   assert( epczTranCode != NULL );
+   assert( opczSvcName  != NULL );
+
+   pstKernSvc = (KernSvc*)SHM_ReadData( (void*)pcShmAddr, KERNSVC, &iRowNum );
+   if( iRowNum < 0 )
+   {
+      return ADP_FINDSVC_ERR;
+   }
+
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if( pstKernSvc->iNodeId == eiHostNodeId &&
+          strcmp( pstKernSvc->aczTranCode, epczTranCode ) == 0 )
+      {
+         strcpy( opczSvcName, pstKernSvc->aczSvcName );
+         return 0;
+      }
+      pstKernSvc++;
+   }
+
+   return ADP_FINDSVC_ERR;
+}
+
+char *ADP_GetNodeName( int eiNodeId )
+{
+   int iRowNum, iTemp;
+   NodeCommCfg *pstNodeCommCfg;
+
+   pstNodeCommCfg = (NodeCommCfg*)SHM_ReadData( (void*)pcShmAddr,
+                                                NODECOMMCFG, &iRowNum );
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if( pstNodeCommCfg->iNodeId == eiNodeId )
+      {
+         break;
+      }
+      pstNodeCommCfg++;
+   }
+   if( iTemp == iRowNum || iRowNum < 0 )
+   {
+      LOG4C(( LOG_FATAL, "没有定义主机节点%d", eiNodeId ));
+      return NULL;
+   }
+
+   return pstNodeCommCfg->aczNodeName;
+}
+
+/*
+**功能:根据子服务号查找交易代码
+**输入:1 子服务号
+**输出:1 交易代码
+**返回   0-成功,其它失败
+*/
+int ADP_FindTranCode( int eiSubSvcId, char *opczTranCode )
+{
+   int iRowNum, iTemp;
+   SubService *pstSubService;
+
+   assert( opczTranCode != NULL );
+
+   pstSubService = (SubService*)SHM_ReadData( (void*)pcShmAddr,
+                                              SUBSERVICE, &iRowNum );
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if( pstSubService->iSubId == eiSubSvcId )
+      {
+         strcpy( opczTranCode, pstSubService->aczTranCode );
+         return 0;
+      }
+      pstSubService++;
+   }
+
+   return ADP_FIND_TXCODE_ERR;
+}
+
+/*
+**功能：根据服务号和内部子服务号查找报文类型
+**输入：1 服务号
+**      2 内部子服务号
+**返回：报文类型
+*/
+int ADP_FindMsgDscrb( int eiSvcId, int eiSubSeq )
+{
+   ServiceCfg *pstSvcCfg;
+   int iRowNums,
+       iTemp;
+
+   pstSvcCfg = (ServiceCfg*)SHM_ReadData( (void*)pcShmAddr,
+                                          SERVICECFG, &iRowNums );
+   for( iTemp = 0; iTemp < iRowNums; iTemp++ )
+   {
+      if( pstSvcCfg->iSvcId == eiSvcId && pstSvcCfg->iSubSeq == eiSubSeq )
+      {
+         return pstSvcCfg->iLstId;
+      }
+      pstSvcCfg++;
+   }
+
+   /* 此处的return不会执行 */
+   return 0;
+}
+
+/*
+** function:send answer to channel
+**          we can assume that the host can receive repeat field
+**          HeadFlag ASCII_FOUR_HAS_HEAD
+** input:1 subservice identify
+**       2 subservice request
+**       3 service structure
+** output:1 subservice answer list
+** return:0-success,1-failed
+*/
+int ADP_SysError( int eiSubID, int eiSubSeq,
+                  UDP epfReqList, UDP opfRspList,
+                  SVC_Content * epstService )
+{
+   /*错误原因从epstService的aczErrorMessage得到*/
+   /*aczErrorMessage格式"错误主机节点|错误代码|错误原因"*/
+
+   int  iRet, iLen;
+   int  iChanNodeId;
+   int  iSendLen;
+   char aczChanRetCode[21], aczHostRetCode[21];
+   char aczHostErrMsg[200];
+   char aczChanErrMsg[200];
+   char aczSendBuf[1024];
+   char aczChanTranCode[7];
+
+   char *pTmp1, *pTmp2;
+
+   assert( epstService   != NULL );
+
+   if( 1 )
+   {
+      memset( aczChanRetCode,0, sizeof( aczChanRetCode ) );
+      memset( aczChanErrMsg, 0, sizeof( aczChanErrMsg ) );
+      memset( aczChanTranCode, 0, sizeof( aczChanTranCode ) );
+      memset( aczHostRetCode,0, sizeof( aczHostRetCode ) );
+      memset( aczHostErrMsg, 0, sizeof( aczHostErrMsg ) );
+
+      iChanNodeId = epstService->iChannelId;
+      memcpy( aczChanTranCode, epstService->stSubSvcHead.aczTranCode, 6 );
+
+      switch( iChanNodeId )
+      {
+      case 100:/*柜面业务*/
+         ADP_ToChanErr_GT( eiSubID, eiSubSeq,
+                               epfReqList, opfRspList,
+                               epstService );
+         break;
+      case 101:/*管理业务*/
+
+         memset( aczSendBuf, 0x00, sizeof(aczSendBuf) );
+         sprintf( aczSendBuf, "%9s%60s", "999999999", "应用服务系统错误" );
+         iSendLen = strlen( aczSendBuf );
+         iRet = sendBuffer( aczSendBuf, (apr_size_t)iSendLen );
+         if( iRet < 0 )
+         {
+            LOG4C(( LOG_FATAL, "Send error" ));
+            return ADP_SMTS_ERR;
+         }
+         else
+         {
+            LOG4C(( LOG_DEBUG, "Plat has send to channel [%d]bytes, trancode[%s]\n[%s]",
+                    iRet, aczChanTranCode, aczSendBuf ));
+         }
+         break;
+
+      default:
+         LOG4C(( LOG_FATAL, "错误的渠道节点号[%d]", iChanNodeId ));
+         return -1234;
+
+      }
+   }
+
+   return 0;
+}
+
+int searchSubSvc1( const void *p1, const void *p2 )
+{
+   SubService *ps1 = (SubService *)p1;
+   SubService *ps2 = (SubService *)p2;
+
+   return ps1->iSubId - ps2->iSubId;
+}
+
+int searchNodeCom1( const void *p1, const void *p2 )
+{
+   NodeCommCfg *ps1 = (NodeCommCfg *)p1;
+   NodeCommCfg *ps2 = (NodeCommCfg *)p2;
+
+   return ps1->iNodeId - ps2->iNodeId;
+}
+
+/**
+  * 根据子服务编号查找ADP服务器地址,端口和服务名
+  * 成功返回0, 失败返回 -1
+  */
+int ADP_GetService( int eiSubSvcId, ADPService *opstAdpService )
+{
+   SubService  *pstSubBegin, stSubKey, *pstSubRlt;
+   NodeCommCfg *pstComBegin, stComKey, *pstComRlt;
+   int iRowNum;
+
+   EXEC SQL BEGIN DECLARE SECTION;
+      char aczBuf[100];
+      char aczPort[100];
+      char aczTimeOut[10];
+      int  iPort=0;
+      int  iTimeOut=0;
+   EXEC SQL END DECLARE SECTION;
+
+   assert( opstAdpService != NULL );
+
+   stSubKey.iSubId = eiSubSvcId;
+   pstSubBegin = (SubService *)SHM_ReadData ( (void *)pcShmAddr,
+                                              SUBSERVICE, &iRowNum );
+   pstSubRlt = (SubService *)bsearch( (void*)&stSubKey,(const void*)pstSubBegin,
+                                      iRowNum, sizeof(stSubKey), searchSubSvc1 );
+   if( pstSubRlt == NULL )
+   {
+      return -1;
+   }
+
+   stComKey.iNodeId = pstSubRlt->iNodeId;
+   pstComBegin = (NodeCommCfg *)SHM_ReadData( (void*)pcShmAddr,
+                                              NODECOMMCFG, &iRowNum );
+   pstComRlt = (NodeCommCfg *)bsearch( (void*)&stComKey,
+                                       (const void*)pstComBegin,
+                                       iRowNum, sizeof(stComKey),
+                                       searchNodeCom1 );
+   if( pstComRlt == NULL )
+   {
+      return -1;
+   }
+
+   strcpy( opstAdpService->aczServerIp, pstComRlt->aczHostIp );
+   opstAdpService->iServerPort = pstComRlt->iHostCommPort;
+   strcpy( opstAdpService->aczService, pstSubRlt->aczNotes );
+   if( pstSubRlt->iTranCodeSeq <= 0 )
+   {
+      opstAdpService->iTimeOut = 60;
+   }
+   else
+   {
+      opstAdpService->iTimeOut = pstSubRlt->iTranCodeSeq;
+   }
+
+   LOG4C(( LOG_DEBUG, "主机端口号[%d], 超时时间[%d]秒",
+           pstComRlt->iHostCommPort, opstAdpService->iTimeOut ));
+
+   return 0;
+}
+
+int sendUDOData( FILE *fpWrite, FILE *fpRead, char *pczData, int iSendLen )
+{
+   int iPos = 0, iFragLen, iSend;
+   char aczConfirm[10];
+
+   do
+   {
+      iFragLen = (iSendLen-iPos)>1024? 1024: iSendLen-iPos;
+      if( tcp_wait_send( fileno(fpWrite), 20000 ) == false )
+      {
+         LOG4C(( LOG_FATAL, "发送UDO数据超时" ));
+         return -1;
+      }
+      iSend = fwrite( pczData+iPos, 1, iFragLen, fpWrite );
+      if( iSend == 0 )
+      {
+         LOG4C(( LOG_FATAL, "发送UDO数据出错 %s", strerror(errno) ));
+         return -1;
+      }
+      fflush( fpWrite );
+      iPos += iSend;
+
+      if( tcp_wait_recv( fileno(fpRead), 20000 ) == false )
+      {
+         LOG4C(( LOG_FATAL, "接收确认数据超时" ));
+         return -1;
+      }
+      if( fread( aczConfirm, 1, 1, fpRead ) == 0 )
+      {
+         LOG4C(( LOG_FATAL, "接收确认数据出错 %s", strerror(errno) ));
+         return -1;
+      }
+      if( aczConfirm[0] != '0' )
+      {
+         LOG4C(( LOG_FATAL, "接收的确认数据(%c)不正确", aczConfirm[0] ));
+         return -1;
+      }
+   } while( iPos < iSendLen );
+}
+
+int sendUDO( int iSocket, UDP pstRsp )
+{
+   char aczSendBuf[10240], *pczData, aczSendLen[11];
+   int  iSendLen, iRet = 0;
+   FILE *fpWrite, *fpRead;
+
+   iSendLen = UDO_ValueSize( pstRsp );
+   if( iSendLen <= sizeof(aczSendBuf) )
+   {
+      pczData = aczSendBuf;
+   }
+   else
+   {
+      pczData = (char*)malloc(iSendLen+1);
+   }
+
+   memset( pczData, 0, iSendLen );
+
+   UDO_sprintf( pstRsp, pczData, &iSendLen );
+
+   sprintf( aczSendLen, "%010d", iSendLen );
+   fpWrite = fdopen( iSocket, "w" );
+   if( fpWrite == NULL )
+   {
+      LOG4C(( LOG_FATAL, "发送UDO长度打开写文件出错:%s, socket[%d]", strerror(errno), iSocket ));
+      iRet = -1;
+      goto SEND_RET;
+   }
+
+   fpRead = fdopen( iSocket, "r" );
+   if( fpRead == NULL )
+   {
+      iRet = -1;
+      LOG4C(( LOG_FATAL, "发送UDO长度打开读文件出错:%s", strerror(errno) ));
+      fclose( fpWrite );
+      goto SEND_RET;
+   }
+
+   if( tcp_wait_send( fileno(fpWrite), 2000 ) == false )
+   {
+      LOG4C(( LOG_FATAL, "发送UDO长度超时" ));
+      iRet = -1;
+      goto SEND_ERR_RET;
+   }
+   if( fwrite( aczSendLen, 1, 10, fpWrite ) != 10 )
+   {
+      iRet = -1;
+      LOG4C(( LOG_FATAL, "发送UDO长度出错:%s", strerror(errno) ));
+      goto SEND_ERR_RET;
+   }
+   fflush( fpWrite );
+
+   iRet = sendUDOData( fpWrite, fpRead, pczData, iSendLen );
+
+SEND_ERR_RET:
+   fclose( fpWrite );
+   fclose( fpRead );
+
+SEND_RET:
+   if( pczData != aczSendBuf )
+   {
+      free( pczData );
+   }
+
+   return iRet;
+}
+
+int sendUDOData2( int iSocket, char *pczData, int iSendLen )
+{
+   int iPos = 0, iFragLen, iSend;
+   char aczConfirm[10];
+
+   do
+   {
+      iFragLen = (iSendLen-iPos)>1024? 1024: iSendLen-iPos;
+      if( tcp_wait_send( iSocket, 2000 ) == false )
+      {
+         LOG4C(( LOG_FATAL, "发送UDO数据超时" ));
+         return -1;
+      }
+      iSend = fwrite( pczData+iPos, 1, iFragLen, fpWrite );
+      if( iSend == 0 )
+      {
+         LOG4C(( LOG_FATAL,"发送UDO数据出错 %s",strerror(errno) ));
+         return -1;
+    }
+      fflush( fpWrite );
+      iPos += iSend;
+      if( tcp_wait_recv( iSocket, 2000 ) == false )
+      {
+         LOG4C(( LOG_FATAL,"接收确认数据超时"));
+         return -1;
+      }
+      if( fread( aczConfirm, 1, 1, fpRead ) == 0 )
+      {
+         LOG4C(( LOG_FATAL,"接收确认数据出错 %s",strerror(errno)));
+         return -1;
+      }
+      if( aczConfirm[0] != '0' )
+      {
+         LOG4C(( LOG_FATAL,"接收的确认数据(%c)不正确" ));
+         return -1;
+      }
+   } while( iPos < iSendLen );
+
+   return 0;
+}
+
+int sendUDO2( int iSocket, UDP pstRsp )
+{
+   char aczSendBuf[10240], *pczData, aczSendLen[11], aczConfirm[2];
+   int  iSendLen, iRet = 0;
+
+   iSendLen = UDO_ValueSize( pstRsp );
+   if( iSendLen <= sizeof(aczSendBuf) )
+   {
+      pczData = aczSendBuf;
+   }
+   else
+   {
+      pczData = (char*)malloc(iSendLen+1);
+   }
+
+   memset( pczData, 0, iSendLen );
+
+   UDO_sprintf( pstRsp, pczData, &iSendLen );
+
+   sprintf( aczSendLen, "%010d", iSendLen );
+
+   if( tcp_wait_send( iSocket, 2000 ) == false )
+   {
+      LOG4C(( LOG_FATAL, "发送UDO数据超时" ));
+      iRet = -1;
+      goto SEND_RET;
+   }
+   if( fwrite( aczSendLen, 1, 10, fpWrite ) != 10 )
+   {
+      iRet = -1;
+      LOG4C(( LOG_FATAL,"发送UDO长度出错%s",strerror(errno)));
+      goto SEND_RET;
+   }
+   fflush( fpWrite );
+   if( tcp_wait_recv( iSocket, 2000 ) == false )
+   {
+      iRet = -1;
+      LOG4C(( LOG_FATAL,"发送UDO长度接收确认信息超时%s",strerror(errno)));
+      goto SEND_RET;
+   }
+   if( fread( aczConfirm, 1, 1, fpRead ) != 1 )
+   {
+      iRet = -1;
+      LOG4C(( LOG_FATAL,"发送UDO长度接收确认信息超时%s",strerror(errno)));
+      goto SEND_RET;
+   }
+
+   iRet = sendUDOData2( iSocket, pczData, iSendLen );
+   if( iRet == -1 )
+   {
+      LOG4C(( LOG_FATAL,"sendUDOData2 error\n"));
+   }
+
+SEND_RET:
+   if( pczData != aczSendBuf )
+   {
+      free( pczData );
+   }
+
+   return iRet;
+}
+
+/*
+**功能:根据主机返回码(也可以包括返回信息), 得到渠道返回码和返回信息,
+**     如果找不到对应信息,在retcodemap表中自动插入一条记录,需要业务人员维护,
+**     并返回主机返回码和返回信息
+**     主机响应信息和渠道响应信息可以为NULL
+**     DCC主机返回码不唯一,需要同时输入响应信息
+**输入:1 主机节点编号
+**     2 渠道节点编号
+**     3 主机返回码(字符串型)
+**     4 主机返回信息   可以为NULL
+**输出:1 渠道返回码
+**     2 渠道响应信息   可以为NULL
+**返回   0-成功   1-找不到对应关系    其他-失败
+*/
+/*
+EXEC SQL DEFINE RETCODE_LEN 20;
+EXEC SQL DEFINE ERRMESG_LEN 60;
+*/
+int ADP_GetChanRet( int enHostId, int enChanId, char *epczHostRetCode,
+                    char *epczHostRetMsg, char *opczChanRetCode, char *opczChanRetMsg )
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char      aczChRetCode[21];
+    char      aczChRetMsg[201];
+    short     nRetCodeInd;
+    short     nRetMsgInd;
+    char      aczHostRetCode[21];
+    int       nHostId=enHostId;
+    int       nChanId=enChanId;
+    EXEC SQL END DECLARE SECTION;
+
+    memset( aczChRetCode, 0, sizeof( aczChRetCode ) );
+    memset( aczChRetMsg, 0, sizeof( aczChRetMsg ) );
+    memset( aczHostRetCode, 0, sizeof( aczHostRetCode ) );
+
+    PUB_StrTrim( epczHostRetCode, ' ' );
+    strcpy( aczHostRetCode, epczHostRetCode );
+
+    EXEC SQL SELECT ch_ret_code, ch_ret_msg INTO :aczChRetCode :nRetCodeInd, :aczChRetMsg :nRetMsgInd
+          FROM ret_map WHERE host_code=:nHostId and host_ret_code=:aczHostRetCode and ch_code=:nChanId;
+    if (SQLCODE)
+    {
+        if( SQLCODE == DATANOTFOUND )
+        {
+            strcpy( opczChanRetCode, "96" );
+            strcpy( opczChanRetMsg, "系统故障" );
+            return 0;
+        }
+        LOG4C(( LOG_FATAL, "数据库错误,SQLCODE=[%d]", SQLCODE ));
+        return -1;
+    }
+
+    PUB_StrTrim( aczChRetCode, ' ' );
+    PUB_StrTrim( aczChRetMsg,  ' ' );
+    LOG4C(( LOG_DEBUG, "ChanCode[%s][%s]", aczChRetCode, aczChRetMsg ));
+    strcpy( opczChanRetMsg, aczChRetMsg );
+    strcpy( opczChanRetCode, aczChRetCode );
+
+    return 0;
+}
+
+/*
+**功能: 在ADP_GetChanRet的基础上修改了响应信息的长度(20-->60)
+**      luoaiping add 20090618
+*/
+int ADP_GetChanRet2( int eiHostNodeId, int eiChanNodeId, char *epczHostCode,
+                    char *epczHostMsg, char *opczChanCode, char *opczChanMsg )
+{
+   int iRow, iTemp;
+   EXEC SQL BEGIN DECLARE SECTION;
+      int iHostNodeId, iChanNodeId;
+      char aczHostCode[100], aczHostMsg[256];
+      struct _RetCodeMap
+      {
+         int iHostNodeId;
+         int iChanNodeId;
+         char aczChanRetCode[ 20 + 1 ];
+         char aczChanRetMsg[ 60 + 1 ];  /* 20-->60 */
+         char aczHostRetCode[ 20 + 1 ];
+         char aczHostRetMsg[ 60 + 1 ];  /* 20-->60 */
+         char aczFlag[2];
+      };
+   struct _RetCodeMap stRetCodeMap;
+   EXEC SQL END DECLARE SECTION;
+
+   assert( epczHostCode != NULL );
+   assert( opczChanCode != NULL );
+
+   memset( aczHostCode, 0, sizeof(aczHostCode) );
+   memset( aczHostMsg, 0, sizeof(aczHostMsg) );
+   memset( &stRetCodeMap, 0, sizeof(stRetCodeMap) );
+
+   iHostNodeId = eiHostNodeId;
+   iChanNodeId = eiChanNodeId;
+
+   PUB_StrTrim( epczHostCode, ' ' );
+   strcpy( aczHostCode, epczHostCode );
+
+   if( epczHostMsg != NULL )
+   {
+      PUB_StrTrim( epczHostMsg, ' ' );
+      strcpy( aczHostMsg, epczHostMsg );
+   }
+
+   PUB_StrTrim( epczHostCode, ' ' );
+   if( strlen( aczHostCode ) == 0 )
+   {
+      LOG4C(( LOG_FATAL, "%d in %s 主机响应码为空" ));
+   }
+
+   if( epczHostMsg != NULL )
+   {
+      PUB_StrTrim( epczHostMsg, ' ' );
+      strcpy( aczHostMsg, epczHostMsg );
+   }
+
+   if( epczHostMsg == NULL )
+   {
+      /*EXEC SQL select first 1 * into :stRetCodeMap from retcodemap*/
+      EXEC SQL select * into :stRetCodeMap from retcodemap
+               where hostnodeid=:iHostNodeId and
+                     channodeid=:iChanNodeId and
+                     hostretcode=:aczHostCode and rownum=1;
+   }
+   else
+   {
+      /*EXEC SQL select first 1 * into :stRetCodeMap from retcodemap*/
+      EXEC SQL select * into :stRetCodeMap from retcodemap
+               where hostnodeid=:iHostNodeId and
+                     channodeid=:iChanNodeId and
+                     hostretcode=:aczHostCode and
+                     hostretmsg=:aczHostMsg and rownum=1;
+   }
+
+   /*if( sqlca.sqlcode!=0 && sqlca.sqlcode!=DATANOTFOUND )*/
+   if( sqlca.sqlcode!=0 )
+   {
+      LOG4C(( LOG_FATAL, "数据库错误.[%d] 主机编号[%d], 渠道编号[%d],主机响应码[%s]",
+              sqlca.sqlcode, iHostNodeId, iChanNodeId, aczHostCode ));
+      strcpy( opczChanCode, "200001" );
+      if( opczChanMsg != NULL )
+      {
+         strcpy( opczChanMsg, "应用服务系统错误" );
+      }
+      return -1;
+   }
+   else if( sqlca.sqlcode == 100 ) /*找不到对应记录*/
+   {
+      LOG4C(( LOG_FATAL, "找不到对应记录,添加错误对照记录.[%d] 主机编号[%d]"
+              ", 渠道编号[%d],主机响应码[%s]", sqlca.sqlcode,
+              iHostNodeId, iChanNodeId, aczHostCode ));
+      memset( &stRetCodeMap, 0, sizeof(stRetCodeMap) );
+      stRetCodeMap.iHostNodeId = iHostNodeId;
+      stRetCodeMap.iChanNodeId = iChanNodeId;
+      strcpy( stRetCodeMap.aczHostRetCode, aczHostCode );
+      strcpy( stRetCodeMap.aczHostRetMsg, aczHostMsg );
+      strcpy( stRetCodeMap.aczFlag, "1" );   /*需要维护*/
+
+      /*EXEC SQL begin work;*/
+      EXEC SQL insert into retcodemap values (:stRetCodeMap);
+      if( sqlca.sqlcode!=0 )
+      {
+         strcpy( opczChanCode, "200001" );
+         if( opczChanMsg != NULL )
+         {
+            strcpy( opczChanMsg, "应用服务系统错误" );
+         }
+         LOG4C(( LOG_FATAL, "数据库错误.[%d] 主机编号[%d], 渠道编号[%d], "
+                 "主机响应码[%s], 主机响应信息[%s]",
+                 sqlca.sqlcode,
+                 iHostNodeId, iChanNodeId, aczHostCode, aczHostMsg ));
+         EXEC SQL rollback work;
+         return -1;
+      }
+      EXEC SQL commit work;
+
+      /*返回主机响应码和响应信息*/
+
+      return 1;
+   }
+   else /*找到对应记录*/
+   {
+      /*未维护*/
+      if( stRetCodeMap.aczFlag[0] == '1' )
+      {
+         return 1;
+      }
+      PUB_StrRightTrim( stRetCodeMap.aczChanRetCode, ' ' );
+      PUB_StrRightTrim( stRetCodeMap.aczChanRetMsg, ' ' );
+      LOG4C(( LOG_DEBUG, "aczChanRetCode[%s],aczChanRetMsg[%s]", stRetCodeMap.aczChanRetCode, stRetCodeMap.aczChanRetMsg ));
+      strcpy( opczChanCode, stRetCodeMap.aczChanRetCode );
+      if( opczChanMsg != NULL )
+      {
+         strcpy( opczChanMsg, stRetCodeMap.aczChanRetMsg );
+      }
+      return 0;
+   }
+
+}
+
+/**
+  * 设置所有子服务都不冲正
+  */
+void ADP_AllNoReverse( SVC_Content * epstService )
+{
+   SUB_SvcList *pstSubSvc;
+
+   assert( epstService != NULL );
+
+   pstSubSvc = epstService->stSubSvcHead.pstNextSubSvc;
+   while( pstSubSvc != NULL )
+   {
+      pstSubSvc->iErrorHandleType = SUB_ERR_NOOP;
+      pstSubSvc = pstSubSvc->pstNextSubSvc;
+   }
+}
+
+/**
+* 发送交易,并取回数据
+*
+* 输入:
+*      char *epczAddr               主机ip
+*      int eiPort                   主机端口
+*      char *epczSendBuf            发送报文
+*      char eiSendLen               发送报文长度
+*      char iTimeOut                发送和接收的超时时间(秒)
+*      char iSendHeadLen            发送报文包头长度,如果为0则不含包头
+*      char iRecvHeadLen            接收报文包头长度,如果为0则不含包头
+* 输出:
+*      char *opczRecvBuf            接收报文
+*      char *opiRecvLen             接收报文长度
+*/
+
+int TransToHost( char *epczAddr, int eiPort, char *epczSendBuf,
+                  int eiSendLen, char *opczRecvBuf, long *opiRecvLen,
+                  int iTimeOut, HeadType h_type )
+{
+   int iSock, iRet, i;
+   int iLen, iRecv;
+   unsigned char sLen[20];
+   char aczSendBuf[2048];
+   char aczRecvBuf[8000];
+   char aczMac[3];
+   char aczRespMsg[120];
+
+   int  iTimeOut_new = 120;
+
+   memset( aczSendBuf, 0, sizeof(aczSendBuf) );
+   memset( aczRecvBuf, 0, sizeof(aczRecvBuf) );
+   memset( sLen, 0x00, sizeof(sLen) );
+   switch( h_type )
+   {
+       case NO_HEAD:
+           break;
+       case HEXBYTE_TWO_NONE_HEAD:
+           sLen[0] = (eiSendLen)/256;
+           sLen[1] = (eiSendLen)%256;
+           memcpy( aczSendBuf, sLen, 2 );
+           memcpy( aczSendBuf+2, epczSendBuf, eiSendLen );
+           iLen = eiSendLen+2;
+           break;
+       case HEXBYTE_TWO_HAS_HEAD:
+           break;
+       case ASCII_FOUR_HAS_HEAD:
+           break;
+       case ASCII_FOUR_NONE_HEAD:
+           break;
+       case THREE_SYNC_HEXBYTE_TWO_NONE_HEAD:
+           break;
+       case ASCII_SIX_NONE_HEAD:
+           break;
+       default:
+           break;
+   }
+   LOG4C(( LOG_DEBUG, "To 前置: [%s:%d] iTimeOut_new:[%d]", epczAddr, eiPort, iTimeOut_new));
+   TOOL_Dump( LOG_DEBUG, "tohost.dump", (unsigned char*)aczSendBuf, iLen );
+   LOG4C(( LOG_DEBUG, "发送报文: [%d]", iLen ));
+   iSock = tcp_connect( epczAddr, eiPort );
+   if( iSock == -1 )
+   {
+      LOG4C(( LOG_FATAL, "与前置[%s:%d]连接失败,error=%s", 
+              epczAddr, eiPort, strerror(errno) ));
+      return ADP_SMTS_ERR;
+   }
+
+   /**
+   * 发送报文体,暂时定为iTimeOut秒超时
+   */
+   //iRet = tcp_ctl_send( iSock, aczSendBuf, iLen, iTimeOut*1000, NO_HEAD );
+   iRet = tcp_ctl_send( iSock, aczSendBuf, iLen, iTimeOut_new*1000, NO_HEAD );
+   if( iRet == -1 )
+   {
+      LOG4C(( LOG_FATAL, "向前置[%s:%d]发送失败,error=%s", 
+              epczAddr, eiPort, strerror(errno) ));
+      tcp_close( iSock );
+      return ADP_SMTS_ERR;
+   }
+   LOG4C(( LOG_FATAL, "已完成报文发送动作." ));
+
+   memset( sLen, 0x00, sizeof(sLen) );
+   switch( h_type )
+   {
+       case NO_HEAD:
+           break;
+       case HEXBYTE_TWO_NONE_HEAD:
+           /* 取报文头(长度) */
+           //iRet = tcp_ctl_recv( iSock, sLen, 2, iTimeOut*1000, NO_HEAD );
+           iRet = tcp_ctl_recv( iSock, sLen, 2, iTimeOut_new*1000, NO_HEAD );
+           if( iRet == -1  )
+           {
+              LOG4C(( LOG_FATAL, "从前置接收报文长度失败, 返回[%d], 原因[%s]", iRet, strerror(errno) ));
+              tcp_close( iSock );
+              return ADP_RMFS_ERR;
+           }
+           iLen = sLen[0]*256 + sLen[1];
+           LOG4C(( LOG_DEBUG, "接收包头内容: [%02x][%02x] = [%d]", sLen[0], sLen[1], iLen ));
+           break;
+       case HEXBYTE_TWO_HAS_HEAD:
+           break;
+       case ASCII_FOUR_HAS_HEAD:
+           break;
+       case ASCII_FOUR_NONE_HEAD:
+           break;
+       case THREE_SYNC_HEXBYTE_TWO_NONE_HEAD:
+           break;
+       case ASCII_SIX_NONE_HEAD:
+           break;
+       default:
+           break;
+   }
+
+   iRecv = 0;
+   if( iLen <= 0 )
+   {
+      LOG4C(( LOG_FATAL, "从前置接收长度失败 [%s]", strerror(errno) ));
+      tcp_close( iSock );
+      return ADP_RMFS_ERR;
+   }
+
+   /* 循环接收20次 */
+   for( i=0; i<20 && iRecv<iLen; i++ )
+   {
+      iRet = 0;
+      //iRet = tcp_ctl_recv( iSock, aczRecvBuf+iRecv, iLen-iRecv, iTimeOut*1000, NO_HEAD );
+      iRet = tcp_ctl_recv( iSock, aczRecvBuf+iRecv, iLen-iRecv, iTimeOut_new*1000, NO_HEAD );
+      if( iRet < 0 )
+      {
+         LOG4C(( LOG_FATAL, "从前置接收报文长度失败, 返回[%d], 原因[%s]", iRet, strerror(errno) ));
+         tcp_close( iSock );
+         return ADP_RMFS_ERR;
+      }
+      iRecv += iRet;
+   }
+
+   tcp_close( iSock );
+
+   TOOL_Dump( LOG_DEBUG, "fromhost.dump", (unsigned char*)aczRecvBuf, iRecv );
+   LOG4C(( LOG_DEBUG, "接收报文:[Len=%d]", iRecv ));
+
+   /* 处理响应信息 */
+   *opiRecvLen = iRecv;
+   
+   memcpy( opczRecvBuf, aczRecvBuf, *opiRecvLen );
+
+   return 0;
+}
+
+int FmtMacData( char *aczMacData, long Len, char *opcMacData )
+{
+   int i,j;
+   char TmpChr;
+
+   j = 0;
+
+   PUB_StrTrim( aczMacData, ' ' );
+   for( i=0; i<Len; i++ )
+   {
+      TmpChr = aczMacData[i];
+      if( TmpChr >= 'a' && TmpChr <='z' )
+          TmpChr = TmpChr - 32;
+      if( TmpChr == ' ' && aczMacData[i+1] == ' ' )
+         continue;
+      if( (TmpChr >= 'A' && TmpChr <= 'Z') || (TmpChr >= '0' && TmpChr <= '9') ||
+          TmpChr == ','  || TmpChr == '.'  || TmpChr == ' ' )
+      {
+          opcMacData[j] = TmpChr;
+          j++;
+      }
+   }
+}
+
+int strcat0( char *aczBuf, int Len )
+{
+   int   i;
+   for( i=0; i< Len; i++ )
+   {
+      if( aczBuf[i] == ' ' )
+      aczBuf[i] = '0';
+   }
+   return 0;
+}
+
+/*
+**end of file
+*/

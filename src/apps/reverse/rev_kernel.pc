@@ -1,0 +1,383 @@
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+#include "udo.h"
+#include "log.h"
+#include "shm_base.h"
+#include "pkg/pkg_api.h"
+#include "adp/adp_tokernel.h"
+#include "easysock.h"
+
+EXEC SQL include sqlca;
+EXEC SQL include "reverse/rev_fun.h";
+
+#define RET_CODE  1017 
+#define RET_MSG   1018
+#define BUFFER_LEN 1024*5
+#define HEAD_LEN  4
+#define RET_MSG_LEN  64
+
+//#define RET_CODE_OFF32 46
+#define RET_CODE_OFF32 47
+  
+static int yh_HostNodeId=200;
+
+#define uchar unsigned char
+#define uint  unsigned int
+
+#define CRC_POLYNOM             0x1021
+#define CRC_PRESET              0x0000         
+#define CRC_CHECKBYTECNT        2
+
+void CRC16(uchar *SerBuffer,uchar length, uchar *pszMac)
+{
+   uchar temp=0;
+   uint i,j;
+   uint Crc;
+
+   Crc = CRC_PRESET;
+
+   for (i = 0; i < length; i++)
+   {
+     Crc = Crc ^((uint)SerBuffer[i] << 8);
+
+     for (j = 0; j < 8; j++)
+     {
+        if (Crc & 0x8000)
+        {
+          Crc = (Crc << 1) ^ CRC_POLYNOM;
+        }
+        else
+        {
+          Crc = (Crc << 1);
+        }
+     }
+   }
+   pszMac[0] = (uchar)(Crc >> 8);
+   pszMac[1] = (uchar) Crc;
+}
+
+uchar CheckYhMac(uchar *SerBuffer,uint length)
+{
+   uchar temp=0;
+   uint i,j;
+   uint Crc;
+return 0;
+   Crc = CRC_PRESET;
+
+   for (i = 0; i < length; i++)
+   {
+     Crc = Crc ^((uint)SerBuffer[i] << 8);
+
+     for (j = 0; j < 8; j++)
+     {
+        if (Crc & 0x8000)
+        {
+          Crc = (Crc << 1) ^ CRC_POLYNOM;
+        }
+        else
+        {
+          Crc = (Crc << 1);
+        }
+     }
+   }
+   if( Crc==0 )
+       return(0);
+   return(1);
+}
+
+int ADP_Transaction_Kernel( char *epczAddr, int eiPort, char *epczSendBuf,
+                  int eiSendLen, char *opczRecvBuf, long *opiRecvLen,
+                  int eiTimeOut , char *aczService )
+{
+   int iSock, iRet, i;
+   int iLen, iRecv;
+   unsigned char sLen[20];
+   unsigned char sTmp[20];
+   char aczSendBuf[2048];
+   char aczRecvBuf[2048];
+   char aczRespMsg[120];
+
+   memset( aczSendBuf, 0, sizeof(aczSendBuf) );
+   memset( aczRecvBuf, 0, sizeof(aczRecvBuf) );
+
+   iLen = eiSendLen;
+   memcpy( aczSendBuf, epczSendBuf, eiSendLen );
+
+   LOG4C(( LOG_DEBUG, "To 前置: [%s:%d]", epczAddr, eiPort ));
+   LOG4C(( LOG_DEBUG, "发送报文: [%d:%s]", iLen, aczSendBuf ));
+   TOOL_Dump( LOG_DEBUG, "toyhsend.dump", (unsigned char*)aczSendBuf, iLen );
+   iSock = tcp_connect( epczAddr, eiPort );
+   if( iSock == -1 )
+   {
+      LOG4C(( LOG_FATAL, "与前置[%s:%d]连接失败,error=%s", 
+              epczAddr, eiPort, strerror(errno) ));
+      return ADP_SMTS_ERR;
+   }
+
+   /**
+   * 发送报文体,暂时定为iTimeOut秒超时
+   */
+   iRet = tcp_ctl_send( iSock, aczSendBuf, iLen, eiTimeOut*1000, NO_HEAD );
+   if( iRet == -1 )
+   {
+      LOG4C(( LOG_FATAL, "向前置[%s:%d]发送失败,error=%s", 
+              epczAddr, eiPort, strerror(errno) ));
+      tcp_close( iSock );
+      return ADP_SMTS_ERR;
+   }
+
+   memset( sLen, 0x00, sizeof(sLen) );
+   /* 取报文头(长度) */
+   iRet = tcp_ctl_recv( iSock, sLen, 8, eiTimeOut*1000, NO_HEAD );
+   if( iRet == -1  )
+   {
+      LOG4C(( LOG_FATAL, "从前置接收报文长度失败, 返回%d, 原因%s",
+              iRet, strerror(errno) ));
+      tcp_close( iSock );
+      return ADP_RMFS_ERR;
+   }
+
+   memset( sTmp, 0, sizeof( sTmp ) );
+   memcpy( sTmp, sLen+4, 4 );
+   iRecv = 0;
+   iLen = atoi( sTmp )-8;
+   LOG4C(( LOG_DEBUG, "接收包头内容: [%s][%d]", sLen, iLen ));
+   if( iLen <= 0 )
+   {
+      LOG4C(( LOG_FATAL, "从前置接收长度失败 [%s]", strerror(errno) ));
+      tcp_close( iSock );
+      return ADP_RMFS_ERR;
+   }
+   /* 循环接收20次 */
+   for( i=0; i<20 && iRecv<iLen; i++ )
+   {
+      iRet =0;
+      iRet = tcp_ctl_recv( iSock, aczRecvBuf+iRecv, iLen-iRecv, eiTimeOut*1000, NO_HEAD );
+      if( iRet == -1 )
+      {
+         LOG4C(( LOG_FATAL, "从前置接收失败 [%s]", strerror(errno) ));
+         tcp_close( iSock );
+         return ADP_RMFS_ERR;
+      }
+      iRecv += iRet;
+   }
+
+   tcp_close( iSock );
+   TOOL_Dump( LOG_DEBUG, "toyhrecv.dump", (unsigned char*)aczRecvBuf, iRecv );
+   LOG4C(( LOG_DEBUG, "接收报文:[%d:%s]", iRecv, aczRecvBuf ));
+   /* 处理响应信息 */
+
+   memcpy( opczRecvBuf, sLen, 8 );
+   memcpy( opczRecvBuf+8, aczRecvBuf, iRecv );
+
+   memcpy( opczRecvBuf+8+iRecv, "RETMSG", 6 );
+   *opiRecvLen = iRecv+8+64;
+
+   return 0;
+}
+
+int REV_AxpKernelTx( char *epczHostIp, int eiPort, UDP pfReq, RevRecord *pstRevRecord )
+{
+   char pfRsp[2048], aczMsgType[18];
+   char aczLen[10];
+   MsgFldCfgAry stMsgFldCfgAry;
+   SubService  *pstSubService;
+   char *p=NULL;
+   char aczRetTmp[20];
+
+   char aczSendBuf[1024*3], opcRecvBuf[1024*3];
+   char aczRetCode[20], aczRetMsg[260];
+   int i, iRet, iTimeOut;
+   int iSendLen, iRecvLen;
+
+   memset( aczSendBuf, 0x00, sizeof(aczSendBuf) );
+   memset( opcRecvBuf, 0x00, sizeof(opcRecvBuf) );
+
+   memset( &stMsgFldCfgAry, 0x00, sizeof(stMsgFldCfgAry) );
+   iRet = PKG_GetInfoByTranCode( pstRevRecord->m_HostNodeId,
+                                 pstRevRecord->m_Trancode,
+                                 1, &stMsgFldCfgAry );
+   if( iRet != 0 )
+   {
+      LOG4C(( LOG_FATAL, "取节点 %d 交易代码 %s 字段组成配置信息出错",
+              pstRevRecord->m_HostNodeId, pstRevRecord->m_Trancode ));
+      return -1;
+   }
+
+   /* 把CMP部的UDO数据类型转换为需要的数据类型 */
+   iRet = PKG_ToMsg( 0, aczSendBuf, &iSendLen, pstRevRecord->m_HostNodeId,
+                     pstRevRecord->m_Trancode, 1, &stMsgFldCfgAry, pfReq );
+   free( stMsgFldCfgAry.pstMsgFldCfg );
+   if( iRet != 0 )
+   {
+      LOG4C(( LOG_FATAL, "节点 %d 交易代码 %s 报文打包出错",
+              pstRevRecord->m_HostNodeId, pstRevRecord->m_Trancode ));
+      return -1;
+   }
+
+   /* 打印UDO日志 */
+   UDO_Prt2File( LOG_DEBUG, "commudo.log", pfReq,
+                 "To Host Node [%d], SvcId [%d]\n",
+                 pstRevRecord->m_HostNodeId, pstRevRecord->m_SubId );
+
+   /* 取交易超时时间 */
+   pstSubService = REV_SearchSubService( pstRevRecord->m_SubId );
+
+   if( pstSubService->iTranCodeSeq <= 0 )
+   {
+      iTimeOut = 60;
+   }
+   else
+   {
+      iTimeOut = pstSubService->iTranCodeSeq;
+   }
+
+   PUB_StrTrim( epczHostIp, ' ' );
+   PUB_StrTrim( pstSubService->aczNotes, ' ' );
+
+   memset( aczLen, 0, sizeof(aczLen) );
+   sprintf( aczLen, "%04d", iSendLen );
+   memcpy( aczSendBuf+4, aczLen, 4 );
+
+   iRet = ADP_Transaction_Kernel( epczHostIp, eiPort,
+                                  aczSendBuf, iSendLen, opcRecvBuf,
+                                  &iRecvLen, iTimeOut,
+                                  pstSubService->aczNotes );
+
+   if( iRet != 0 )
+   {
+      LOG4C(( LOG_DEBUG, "核心自动冲正适配器冲正失败[%d]", iRet ));
+      return -1;
+   }
+
+   memset( aczRetCode, 0x00, sizeof(aczRetCode) );
+   memset( aczRetMsg, 0x00, sizeof(aczRetMsg) );
+   memset( aczMsgType, 0x00, sizeof(aczMsgType) );
+   /* MSG_TYPE的值唯一标识交易是否成功 */
+   memcpy( aczMsgType, opcRecvBuf + RET_CODE_OFF32, 10 );
+   memset( aczRetTmp, 0, sizeof(aczRetTmp) );
+   p=strchr( aczMsgType, '|' );
+   if( p!=NULL )
+   {
+       memcpy( aczRetTmp, aczMsgType, p-aczMsgType );
+   }
+   else
+   {
+       memcpy( aczRetTmp, aczMsgType, strlen(aczMsgType) );
+   }
+   LOG4C(( LOG_DEBUG, "aczMsgType[%s][%s]", aczMsgType, aczRetTmp )); 
+      
+   PUB_StrTrim( aczRetTmp, ' ' );
+   PUB_StrTrim( aczRetTmp, '0' );
+   if( strlen(aczRetTmp)==0 )
+   {
+      memset( &stMsgFldCfgAry, 0x00, sizeof(stMsgFldCfgAry) );
+      iRet = PKG_GetInfoByTranCode( pstRevRecord->m_HostNodeId,
+                                    pstRevRecord->m_Trancode,
+                                    2, &stMsgFldCfgAry );
+      if( iRet != 0 )
+      {
+         LOG4C(( LOG_FATAL, "取节点 %d 交易代码 %s 字段组成配置信息出错",
+                 pstRevRecord->m_HostNodeId, pstRevRecord->m_Trancode ));
+         return -1;
+      }
+
+      /* 初始化UDO数据串*/
+      UDO_Init( pfRsp, sizeof(pfRsp) );
+      iRet = PKG_ToMid( 0, opcRecvBuf, iRecvLen,
+                        pstRevRecord->m_HostNodeId,
+                        pstRevRecord->m_Trancode, 2, &stMsgFldCfgAry, pfRsp );
+      free( stMsgFldCfgAry.pstMsgFldCfg );
+      if( iRet != 0 )
+      {
+         LOG4C(( LOG_FATAL, "节点 %d 交易代码 %s 报文解包出错",
+                 pstRevRecord->m_HostNodeId, pstRevRecord->m_Trancode ));
+         return -1;
+      }
+      return 0;
+   }
+   else
+   {
+      LOG4C(( LOG_DEBUG, "冲正失败[%s]", aczRetTmp ));
+#if 0
+      memset( &stMsgFldCfgAry, 0x00, sizeof(stMsgFldCfgAry) );
+      iRet = PKG_GetInfoByTranCode( pstRevRecord->m_HostNodeId,
+                                    pstRevRecord->m_Trancode,
+                                    -1, &stMsgFldCfgAry );
+      if( iRet != 0 )
+      {
+         LOG4C(( LOG_FATAL, "取节点 %d 交易代码 %s 字段组成配置信息出错",
+                 pstRevRecord->m_HostNodeId, pstRevRecord->m_Trancode ));
+         return -1;
+      }
+
+      /* 初始化UDO数据串*/
+      UDO_Init( pfRsp, sizeof(pfRsp) );
+      iRet = PKG_ToMid( 0, opcRecvBuf, iRecvLen,
+                        pstRevRecord->m_HostNodeId,
+                        pstRevRecord->m_Trancode, -1, &stMsgFldCfgAry, pfRsp );
+      free( stMsgFldCfgAry.pstMsgFldCfg );
+      if( iRet != 0 )
+      {
+         LOG4C(( LOG_FATAL, "节点 %d 交易代码 %s 报文解包出错",
+                 pstRevRecord->m_HostNodeId, pstRevRecord->m_Trancode ));
+         return -1;
+      }
+
+      /* 取错误码 */
+      UDO_GetField( pfRsp, RET_CODE, 0, aczRetCode, 0 );
+      UDO_GetField( pfRsp, RET_MSG, 0, aczRetMsg, 0 );
+      LOG4C(( LOG_FATAL, "[%s] %s:%s", aczMsgType, aczRetCode, aczRetMsg ));
+#endif
+      return -1;
+   }
+
+   /* 打印UDO日志 */
+   UDO_Prt2File( LOG_DEBUG, "commudo.log", pfRsp,
+                 "To Host Node [%d], SvcId [%d]\n",
+                 pstRevRecord->m_HostNodeId, pstRevRecord->m_SubId );
+
+   return 0;
+}
+
+/**
+  * 核心主机冲正适配器
+  */
+int REV_AxpKernel( int eiRevSerial, int eiSubId, UDP pfReq, RevRecord *pstRevRecord )
+{
+   NodeCommCfg *pstNodeComm;
+   SubService  *pstSubService;
+   char aczDmzIp[30];
+   char aczDmzPort[8];
+   /**
+     * 首先查找主机对应节点的通信属性
+     */
+   pstNodeComm = REV_SearchNodeCommCfgBySubId( eiSubId );
+   if( pstNodeComm == NULL )
+   {
+      LOG4C(( LOG_FATAL, "查子服务 %d 通信节点失败", eiSubId ));
+      return -1;
+   }
+
+   memset( aczDmzIp, 0, sizeof(aczDmzIp) );
+   memset( aczDmzPort, 0, sizeof(aczDmzPort) );
+
+   sprintf(aczDmzIp,"%s", getenv("ZJIP"));
+   sprintf(aczDmzPort,"%s", getenv("ZJPORT"));
+
+   /**
+     * 前面已经访问过该子服务, 此处肯定不会出错
+     */
+   pstSubService = REV_SearchSubService( eiSubId );
+
+   /*
+    return REV_AxpKernelTx( pstNodeComm->aczHostIp,
+                           pstNodeComm->iHostCommPort,
+                           pfReq, pstRevRecord );
+     */
+   return REV_AxpKernelTx( aczDmzIp, atoi(aczDmzPort),
+                           pfReq, pstRevRecord );
+}
+

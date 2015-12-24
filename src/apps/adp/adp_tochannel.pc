@@ -1,0 +1,299 @@
+#include "ap_global.h"
+#include "ap_handle.h"
+#include "adp/adp_base.h"
+#include "adp/adp_tochannel.h"
+#include "pkg/pkg_api.h"
+#include "log.h"
+
+EXEC SQL INCLUDE SQLCA;
+/*
+** function:send errmsg answer to channel
+**          HeadFlag ASCII_FOUR_NONE_HEAD
+** input:1 subservice identify
+**       2 subservice request
+**       3 service structure
+** output:1 subservice answer list
+** return:0-success,1-failed
+** 说明：本模板用于向终端渠道发错误响应
+*/
+int ADP_ToChanErr_GT( int eiSubID, int eiSubSeq,
+                     UDP epfReqList, UDP opfRspList,
+                     SVC_Content * epstService )
+{
+   PkgNeedInfo stPkgNeedInfo;
+   MsgFldCfgAry stMsgFldCfgAry;
+   int iRet, iSendLen;
+   char aczSendBuf[20480];
+   char aczMsg[71];
+   char aczHostNodeId[10], aczTranCode[7];
+   char aczAgSerial[9];
+   char *pTmp1, *pTmp2;
+   UDP pfSendList;
+   int  iLstId;
+
+   EXEC SQL BEGIN DECLARE SECTION;
+   char aczChanRetCode[21];
+   char aczHostRetCode[21];
+   char aczChanErrMsg[200];
+   char aczHostErrMsg[200];
+   int  iHostNodeId =0;
+   int  iChanNodeId;
+   EXEC SQL END DECLARE SECTION;
+
+   assert( epstService != NULL );
+   assert( epfReqList != NULL );
+   assert( opfRspList != NULL );
+
+
+   if( epstService->pstSubSvcCurr->iErrorHandleType == SVC_ERR_RSP_ASM ) 
+   {
+      LOG4C(( LOG_FATAL, "出错需要重组,进入错误适配器" ));
+
+      return( ADP_ToChannel_GT( eiSubID, eiSubSeq, epfReqList, opfRspList,
+                                epstService ) );
+   }
+
+   iLstId = epstService->pstSubSvcCurr->iLstId;
+   iChanNodeId = epstService->iChannelId;
+
+   memset( &stMsgFldCfgAry, 0x00, sizeof(stMsgFldCfgAry) );
+   memset( &stPkgNeedInfo, 0x00, sizeof(PkgNeedInfo) );
+   memset( aczChanRetCode,0, sizeof( aczChanRetCode ) );
+   memset( aczChanErrMsg, 0, sizeof( aczChanErrMsg ) );
+   memset( aczHostNodeId, 0x00, sizeof( aczHostNodeId ) );
+   memset( aczHostRetCode,0, sizeof( aczHostRetCode ) );
+   memset( aczHostErrMsg, 0, sizeof( aczHostErrMsg ) );
+   memset( aczMsg, 0x00, sizeof( aczMsg ) );
+   memset( aczSendBuf, 0, sizeof(aczSendBuf) );
+   memset( aczTranCode, 0, sizeof(aczTranCode) );
+
+   pTmp1 = epstService->aczErrorMessage;
+   pTmp2 = strchr( pTmp1, '|' );
+   if( pTmp2 != NULL )
+   {
+      memcpy( aczHostNodeId, pTmp1, (int)(pTmp2 - pTmp1) );
+      iHostNodeId = atoi( aczHostNodeId );
+   }
+   else
+   {
+      strcpy( aczChanRetCode, "111" );
+      strcpy( aczChanErrMsg,  "应用服务系统错误" );
+      LOG4C(( LOG_WARN, "系统配置为不需要重组, 但是aczErrorMessage=[%s]", pTmp1 ));
+      goto ERRGT;
+   }
+
+   pTmp1 = pTmp2 + 1;
+   pTmp2 = strchr( pTmp1, '|' );
+   if( pTmp2 != NULL )
+   {
+      memcpy( aczHostRetCode, pTmp1, (int)(pTmp2 - pTmp1) );
+      strcpy( aczChanRetCode, aczHostRetCode );
+   }
+   else
+   {
+      strcpy( aczChanRetCode, "112" );
+      strcpy( aczChanErrMsg,  "应用服务系统错误" );
+      LOG4C(( LOG_WARN, "系统配置为不需要重组,, 但是aczErrorMessage=[%s]", pTmp1 ));
+      goto ERRGT;
+   }
+
+   pTmp1 = pTmp2 + 1;
+   strcpy( aczHostErrMsg, pTmp1 );
+
+   if( strlen( aczHostErrMsg ) == 0 )
+   {
+      strcpy( aczChanErrMsg, "未知错误" );
+   }
+   else 
+   {
+      strcpy( aczChanErrMsg, aczHostErrMsg );
+   }
+   LOG4C(( LOG_DEBUG, "主机节点号[%d]渠道节点号[%d]主机返回码[%s]",
+			iHostNodeId,iChanNodeId,aczHostRetCode));
+
+ERRGT:
+   EXEC SQL select chanretcode,hostretmsg into :aczChanRetCode,:aczChanErrMsg \
+   from retcodemap where hostnodeid=:iHostNodeId and channodeid=:iChanNodeId \
+                         and hostretcode=:aczHostRetCode and flag="0";
+   PUB_StrTrim( aczChanErrMsg, ' ' );
+   PUB_StrTrim( aczChanRetCode, ' ' );
+
+   sprintf( aczMsg, "%s[%s]", aczChanErrMsg, aczChanRetCode );
+
+   memcpy( aczTranCode, epstService->stSubSvcHead.aczTranCode, 6 );
+   aczTranCode[6] = '\0';
+   PUB_StrTrim( aczTranCode, ' ' );
+   
+   getString( "agserial", aczAgSerial );
+
+   UDO_AddField( epfReqList, 1862, UDT_STRING, "", 0 );
+   UDO_AddField( epfReqList, 1816, UDT_STRING, aczTranCode, strlen(aczTranCode) );
+   UDO_AddField( epfReqList, 2161, UDT_STRING, "", 0 );
+   UDO_AddField( epfReqList, 1839, UDT_STRING, "", 0 );
+   UDO_AddField( epfReqList, 1824, UDT_STRING, aczAgSerial, strlen(aczAgSerial) );
+   UDO_AddField( epfReqList, 1837, UDT_STRING, aczHostRetCode, strlen(aczHostRetCode) );
+   UDO_AddField( epfReqList, 2358, UDT_STRING, aczMsg, strlen(aczMsg) );
+   UDO_AddField( epfReqList, 1836, UDT_INT, (char*)&iHostNodeId, 0 );
+
+   memset( aczSendBuf,0x00,sizeof( aczSendBuf ) );
+   sprintf( aczSendBuf, "0000%-6s%-26s%-60s%08s%-10s%-50s%-5s",
+            aczTranCode, " ", " ", aczAgSerial, aczChanRetCode, aczChanErrMsg,
+            " " );
+   iSendLen = 169;
+   iRet = sendBuffer( aczSendBuf, iSendLen );
+   if( iRet == -1 )
+   {
+      sprintf( epstService->aczErrorMessage,
+               "SendMsgToSocket error!iSendLen %d,iRet %d",
+               iSendLen, iRet );
+      LOG4C(( LOG_FATAL, epstService->aczErrorMessage ));
+      return ADP_FAIL;
+   }
+   else
+   {
+      LOG4C(( LOG_DEBUG, "Server has send [%d]\n[%s]", iRet, aczSendBuf ));
+   }
+   
+   return 0;
+} 
+
+/*
+**说明:本函数用于往柜台渠道发正确响应
+**渠道返回适配器基本步骤:
+**
+**1 准备打包需要的数据,包含打包的函数ID,配置的交易代码等信息,
+**  一般调用 ADP_GetChanPkgNeedInfo
+**
+**2 根据交易代码和报文标志查找该交易的报文字段配置信息,
+**  一般调用 PKG_GetInfoByTranCode
+**
+**3 调用打包函数打包
+**  一般调用 PKG_ToMsg
+**
+**4 调用渠道返回函数, 将数据返回到渠道
+**  一般调用 COM_SendBuffer
+*/
+int  ADP_ToChannel_GT( int eiSubID,    int eiSubSeq,
+                       UDP epfReqList, UDP opfRspList,
+                       SVC_Content   * epstService )
+{
+   char aczSendBuf[20480];
+   int iRet, iLstId, iSendLen;
+   PkgNeedInfo stPkgNeedInfo;
+   MsgFldCfgAry stMsgFldCfgAry;
+   SUB_SvcList *pstSubSvcCfg;
+   char aczHostNodeId[10];
+   char *pTmp1, *pTmp2;
+   int iAsmRetCodeFlag=0;
+
+   EXEC SQL BEGIN DECLARE SECTION;
+   int  iHostNodeId;
+   int  iChanNodeId;
+   char aczChanRetCode[21];
+   char aczHostRetCode[21];
+   EXEC SQL END DECLARE SECTION;
+
+   iChanNodeId = epstService->iChannelId;
+
+   iLstId = epstService->pstSubSvcCurr->iLstId;
+   /*iLstId =2;*/
+   pstSubSvcCfg = epstService->pstSubSvcCurr;
+
+   iRet = ADP_GetChanPkgNeedInfo(epstService->iSvcId, eiSubID, &stPkgNeedInfo);
+   if( iRet != 0 )
+   {
+      sprintf( epstService->aczErrorMessage,
+               "%d in %s get the package need information error %d",
+               __LINE__, __FILE__, iRet );
+      LOG4C(( LOG_FATAL, "get the package need information error %d", iRet ));
+      return ADP_GPNI_ERR;
+   }
+   memset( &stMsgFldCfgAry, 0x00, sizeof(stMsgFldCfgAry) );
+   iRet = PKG_GetInfoByTranCode( epstService->iChannelId, 
+                                 stPkgNeedInfo.aczTranCode, iLstId,
+                                 &stMsgFldCfgAry );
+   if( iRet != 0 )
+   {
+      sprintf( epstService->aczErrorMessage,
+               "取报文%d域配置出错",
+               stPkgNeedInfo.iPkgAppId );
+      LOG4C(( LOG_FATAL, epstService->aczErrorMessage ));
+
+      return ADP_GIFMFC_ERR;
+   }
+   memset( aczHostRetCode,0x00,sizeof( aczHostRetCode ) );
+   if( iChanNodeId== 10 )
+   {
+      UDO_GetField( epfReqList,8,0,aczHostRetCode,0 );
+      if( strncmp( aczHostRetCode,"0000",4 )!=0 )
+      {
+         iAsmRetCodeFlag=1;
+      }
+   }
+   if( iChanNodeId== 11 )
+   {
+      UDO_GetField( epfReqList,45,0,aczHostRetCode,0 );
+      if( strncmp( aczHostRetCode,"0000",4 )!=0 )
+      {
+         iAsmRetCodeFlag=1;
+      }
+   }
+   if( iAsmRetCodeFlag==1 )        /*需要重组返回码*/
+   {
+       pTmp1 = epstService->aczErrorMessage;
+       pTmp2 = strchr( pTmp1, '|' );
+       if( pTmp2 != NULL )
+       {
+           memcpy( aczHostNodeId, pTmp1, (int)(pTmp2 - pTmp1) );
+           iHostNodeId = atoi( aczHostNodeId );
+       }
+       pTmp1=pTmp2+1;
+       pTmp2 = strchr( pTmp1, '|' );
+       if( pTmp2 != NULL )
+       {
+           memcpy( aczHostRetCode, pTmp1, (int)(pTmp2 - pTmp1) );
+       }
+
+       memset( aczChanRetCode,0x00,sizeof( aczChanRetCode ) );
+       EXEC SQL select chanretcode into :aczChanRetCode \
+          from retcodemap where hostnodeid=:iHostNodeId \
+          and channodeid=:iChanNodeId \
+                         and hostretcode=:aczHostRetCode and flag="0";
+       PUB_StrTrim( aczChanRetCode,' ');
+       if( strlen( aczChanRetCode )>0 )
+       {
+          if( stPkgNeedInfo.iNodeId== 10 )
+          {
+             UDO_ACField( epfReqList,8,UDT_STRING,aczChanRetCode,
+                        strlen(aczChanRetCode) );
+          }
+          if( stPkgNeedInfo.iNodeId== 11 )
+          {
+             UDO_ACField( epfReqList,45,UDT_STRING,aczChanRetCode,
+                        strlen(aczChanRetCode) );
+          }
+       }
+   }
+   memset( aczSendBuf, 0, sizeof(aczSendBuf) );
+   iRet = PKG_ToMsg( 0, aczSendBuf, &iSendLen,
+                     stPkgNeedInfo.iNodeId, stPkgNeedInfo.aczTranCode,
+                     iLstId, &stMsgFldCfgAry, epfReqList );
+   free( stMsgFldCfgAry.pstMsgFldCfg );
+   if( iRet != 0 )
+   {
+      sprintf( epstService->aczErrorMessage,
+               "%d in %s子服务%d打包出错,交易代码%s,返回%d",
+               __LINE__, __FILE__, eiSubID, stPkgNeedInfo.aczTranCode, iRet );
+      LOG4C(( LOG_FATAL, epstService->aczErrorMessage ));
+
+      return ADP_PKGTOMSG_ERR;
+   }
+
+   if( sendBuffer( aczSendBuf, iSendLen ) == -1 )
+   {
+      LOG4C(( LOG_FATAL, "往渠道返回信息出错%s", strerror(errno) ));
+      return -1;
+   }
+
+   return 0;
+}

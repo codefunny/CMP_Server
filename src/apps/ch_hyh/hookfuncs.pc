@@ -1,0 +1,303 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include "apr_network_io.h"
+#include "ap_global.h"
+#include "udo.h"
+#include "log.h"
+#include "tool_base.h"
+#include "ap_base.h"
+#include "pub_base.h"
+#include "ap_handle.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+extern int DataBaseConnect(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#define DATALEN 4
+
+/**
+  * 以下函数执行顺序和大致关系如下
+  * main
+  * BEGIN main
+  *    onSysStart( argv[0] );
+  *
+  *    while( doBusiness )
+  *    BEGIN while
+  *       acceptClientConnect;//等待客户端连接
+  *       recvBuffer          //从客户端接收数据
+  *       preCheck            //对接收的数据做预检查
+  *       onTxStart           //交易开始
+  *       unPack              //拆包
+  *       postCheck           //拆包后预处理
+  *       doTrans             //根据配置信息执行交易,在适配器中调用sendBuffer
+  *       onTxEnd             //交易结束
+  *    END while
+  *
+  *    onSysEnd
+  * END main
+  */
+
+int onSysStart( char *pczLogicName )
+{
+   int iRet;
+
+   if( iRet = DataBaseConnect() )
+   {
+      printf( "connect to database server error, SQLCODE = [%d]\n", iRet );
+      LOG4C (( LOG_FATAL, "connect to database server error, SQLCODE = [%d]", iRet ));
+      return -1;
+   }
+   DataBaseDisConnect();
+
+   return 0;
+}
+
+int onSysEnd( void )
+{
+   //return DataBaseDisConnect();
+   return 0;
+}
+
+/* 该全局变量在日志函数中使用，不能去除 */
+extern char *pczExecFileName;
+extern TOOL_LogInfo stToolLogInfo;
+extern apr_pool_t *gpstLocalPool;
+
+int onTxStart( char *pczLogicName )
+{
+   char aczTxSerial[20], aczTxDate[9];
+   long lSerial = 0;
+   int iRet;
+   char aczDayEnd[10];
+
+   /* 请不要删除 globalInit函数, 必须在第一行 */
+   globalInit();
+
+   if( iRet = DataBaseConnect() )
+   {
+      LOG4C (( LOG_FATAL, "connect to database server error, SQLCODE = [%d]", iRet ));
+      return -1;
+   }
+   memset( aczTxDate, 0, sizeof(aczTxDate) );
+   memset( aczTxSerial, 0, sizeof(aczTxSerial) );
+
+   iRet= getPtSerialDate( &lSerial, aczTxDate );
+   if( iRet != 0 )
+   {
+       return -1;
+   }
+
+   LOG4C(( LOG_DEBUG, "流水 [%d] 日期 [%s] \n", lSerial, aczTxDate ));
+   sprintf( aczTxSerial, "%d", lSerial );
+
+   memset( aczDayEnd, 0, sizeof(aczDayEnd) );
+   aczDayEnd[0]='0';
+   if( (char *)getenv("IS_DAY_CUT") != NULL )
+   {
+       strcpy( aczDayEnd, getenv("IS_DAY_CUT") );
+   }
+   if( aczDayEnd[0]=='0')
+   {
+       TOOL_GetSystemYYYYMMDD( aczTxDate );
+   }
+
+   /* 然后可调用 addXXX 函数, 在CMP运行过程中可调用 getXXX 函数 */
+   /* 如数据字典编号, 在此用 addInt( "dictid", 12 )             */
+   /* 在系统运行时候可调用 getInt( "dictid", &iDictId )取值     */
+   addString( "execfile", pczLogicName );
+   addString( "agserial", aczTxSerial );
+   addString( "agtxdate", aczTxDate );
+
+   return 0;
+}
+
+int onTxEnd( void )
+{
+   DataBaseDisConnect();
+   return 0;
+}
+
+int preCheck( char *pczBuffer, int iLen )
+{
+   return 0;
+}
+
+int postCheck( UDP pUdo , char *pczBuffer, int iLen )
+{
+   char aczTerminalId[20];
+   char aczMerchantId[20];
+   int nDataLen=0;
+
+   memset( aczTerminalId, 0, sizeof( aczTerminalId ) );
+   memset( aczMerchantId, 0, sizeof( aczMerchantId ) );
+/*
+   if( IsCheckMac( pUdo ) )
+   {
+       getBinary( "36", aczTerminalId, &nDataLen );
+       getBinary( "3A", aczMerchantId, &nDataLen );
+       LOG4C(( LOG_DEBUG, "postCheck[%s][%s][iLen=%d]", aczTerminalId, aczMerchantId, iLen ));
+       if( CheckMac( pczBuffer, iLen-8, aczTerminalId, aczMerchantId ) != 0 )
+       {
+          LOG4C(( LOG_FATAL, "Mac 校验失败!" ));
+          return -1;
+       }
+   }
+*/   
+   return 0;
+}
+
+/**
+  * to access the pczExecFileName in the adaptor
+  * declare it as static
+  */
+static char aczLogFileName[128];
+
+int getTxCode( char *pczBuffer, char *pczTxCode )
+{
+   char aczExecFile[64];
+   int iRet=0;
+   unsigned char aczBitMap[130];
+   unsigned char aczLen[8];
+   unsigned int iLen=0;
+   unsigned int iPos=0;
+
+   memcpy( pczTxCode, pczBuffer, 6 );
+   pczTxCode[6]=0;
+gettxcode:
+   memset( aczExecFile, 0, sizeof(aczExecFile) );
+   getString( "execfile", aczExecFile );
+   addString( "txcode", pczTxCode );
+
+   LOG4C(( LOG_DEBUG, "交易代码 [%s] 可执行程序名 [%s]\n", pczTxCode, aczExecFile ));
+
+   /** 请不要在其它任何地方修改 pczExecFileName **/
+   pczExecFileName = aczLogFileName;
+   sprintf( pczExecFileName, "%s/%s", aczExecFile, pczTxCode );
+   sprintf( stToolLogInfo.aczFileName, "%s/%s/aep_run.log", getenv( "TRACE_PATH" ), pczExecFileName );
+   return 0;
+}
+
+
+/**
+  * 以下函数属于通讯
+  */
+extern apr_socket_t *pstClient;
+
+/**
+  * pczBuffer 是用于保存接收内容, 缓冲区初始长度保存在 *ptLen 中
+  * 如果改长度不够, 则需要在 recvBuffer 函数中重新分配
+  * 分配必须使用 apr_palloc 函数, 第一个参数必需是 gpstLocalPool
+  * 系统会自动回收通过 apr_palloc 分配的空间
+  * 禁止使用 malloc 等分配函数
+  */
+int recvBuffer( char **pczBuffer, apr_size_t *ptLen )
+{
+   /** 先读4个字节长度, 再根据长度信息读数据内容 **/
+   unsigned char aczLen[8];
+   char aczBuffer[2048];
+   int i;
+   unsigned int iRecvLen=0;
+   apr_size_t tLen = DATALEN;
+
+   memset( aczBuffer, 0, sizeof(aczBuffer) );
+   memset( aczLen, 0, sizeof(aczLen) );
+   apr_socket_timeout_set( pstClient, 2000000 );
+
+   if( apr_socket_recv( pstClient, aczLen, &tLen ) != APR_SUCCESS )
+   {
+      LOG4C(( LOG_WARN, "接收请求报文长度出错[%s]\n", strerror(errno) ));
+      return -1;
+   }
+   if( tLen != DATALEN )
+   {
+      LOG4C(( LOG_WARN, "接收请求报文长度出错[%s]\n", strerror(errno) ));
+      return -1;
+   }
+
+   memcpy( aczBuffer, aczLen, DATALEN );
+   tLen = atoi(aczLen);
+   LOG4C(( LOG_DEBUG, "接收长度 [%d] 内容 [%s]\n", tLen, aczLen));
+
+   if( tLen > *ptLen )
+   {
+      *pczBuffer = (char*)apr_palloc( gpstLocalPool, tLen+1 );
+      LOG4C(( LOG_DEBUG, "APR_PALLOC again" ));
+   }
+
+   for (i=0; i<10; i++)
+   {
+      *ptLen = tLen-iRecvLen;
+
+      if( apr_socket_recv( pstClient, aczBuffer+DATALEN+iRecvLen, ptLen ) != APR_SUCCESS )
+      {
+         LOG4C(( LOG_WARN, "接收请求报文出错[%s]\n", strerror(errno) ));
+         return -1;
+      }
+      iRecvLen+=*ptLen;
+      if( iRecvLen >= tLen ) 
+      {
+         break;
+      }
+   }
+   if( i==10 )
+   {
+         LOG4C(( LOG_WARN, "接收请求报文出错[%s]\n", strerror(errno) ));
+         return -1;
+   } 
+
+   memcpy( *pczBuffer,  aczBuffer+DATALEN, *ptLen );
+
+   LOG4C(( LOG_DEBUG, "接收长度 [%d] \n", tLen));
+
+
+   TOOL_Dump( LOG_DEBUG, "recv.dump", (unsigned char*)aczBuffer, tLen+DATALEN );
+
+   return *ptLen;
+}
+
+/**
+  * 发送6字节长度再发送字符串
+  */
+int sendBuffer( char *pczBuffer, apr_size_t tSendLen )
+{
+   unsigned char aczLen[8];
+   apr_size_t tLen = 2;
+   apr_size_t tAcctLen=0;
+   apr_size_t tTotalLen=0;
+   char aczBuffer[2048];
+   int n;
+
+   memset( aczBuffer, 0, sizeof(aczBuffer) );
+   sprintf(aczLen,"%0*d",DATALEN,tSendLen);
+
+   memcpy(aczBuffer, aczLen, DATALEN);
+   memcpy( aczBuffer+DATALEN, pczBuffer, tSendLen );
+   tTotalLen = DATALEN+tSendLen;
+
+   do
+   {
+      tLen=tTotalLen-tAcctLen;
+
+      if( apr_socket_send( pstClient, aczBuffer, &tLen ) != APR_SUCCESS )
+      {
+         LOG4C(( LOG_WARN, "1发送响应报文出错[%s]\n", strerror(errno) ));
+         return -1;
+      }
+      tAcctLen+=tLen;
+   } while( tAcctLen<tTotalLen );
+
+   LOG4C(( LOG_DEBUG, "发送长度 [%d] \n", tAcctLen ));
+   TOOL_Dump( LOG_DEBUG, "send.dump", (unsigned char*)aczBuffer, tAcctLen );
+
+   return 0;
+}
+

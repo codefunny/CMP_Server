@@ -1,0 +1,518 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
+#include "shm_base.h"
+#include "ap_global.h"
+#include "log.h"
+
+extern int giConfigKey;
+extern char *pcShmAddr;
+
+EXEC SQL INCLUDE SQLCA;
+EXEC SQL include "monitor.h";
+
+int DisConnectDB()
+{
+    EXEC SQL COMMIT WORK RELEASE;
+}
+
+int DataBaseConnect()
+{
+   EXEC SQL BEGIN DECLARE SECTION;
+   varchar stUsername[20];
+   varchar stPassword[20];
+   varchar stDbSid[20];
+   char stDbName[20];
+   EXEC SQL END DECLARE SECTION;
+
+   char *pczUsername;
+   char *pczPassword;
+   char *pczDbSid;
+   char *pczDbname;
+
+   if( (pczUsername=(char *)getenv("DBUSER")) == NULL )
+   {
+      LOG4C(( LOG_DEBUG, "请先设置环境变量DBUSER" ));
+      return -1;
+   }
+
+   if( (pczPassword=(char *)getenv("DBPASS")) == NULL )
+   {
+      LOG4C(( LOG_DEBUG, "请先设置环境变量DBPASS" ));
+      return -1;
+   }
+
+   strcpy( (char *)stUsername.arr, pczUsername );
+   strcpy( (char *)stPassword.arr, pczPassword );
+   stUsername.len = strlen( pczUsername );
+   stPassword.len = strlen( pczPassword );
+
+   if( (pczDbSid=(char *)getenv("ORACLE_ADDR")) == NULL )
+   {
+      EXEC SQL CONNECT :stUsername IDENTIFIED BY :stPassword;
+   }
+   else
+   {
+      strcpy( (char *)stDbSid.arr, pczDbSid );
+      stDbSid.len   = strlen( pczDbSid );
+      EXEC SQL CONNECT :stUsername IDENTIFIED BY :stPassword USING :stDbSid;
+   }
+
+   if( SQLCODE != 0 )
+   {
+      LOG4C(( LOG_DEBUG, "CONNECT DATABASE ERROR[%d]", SQLCODE ));
+      return SQLCODE;
+   }
+
+   /******************************FOR INFORMIX******************
+   EXEC SQL BEGIN DECLARE SECTION;
+   char *pczDatabase;
+   EXEC SQL END DECLARE SECTION;
+
+   pczDatabase = getenv( "AGENT_DB" );
+   if( pczDatabase == NULL )
+   {
+      LOG4C(( LOG_FATAL, "please set env AGENT_DB first " ));
+      return -1;
+   }
+   sqldetach();
+   EXEC SQL database :pczDatabase;
+   if( SQLCODE != 0 )
+   {
+      LOG4C(( LOG_FATAL,
+              "connect to database server error, SQLCODE = [%d]",
+              SQLCODE ));
+      return -1;
+   }
+   ******************************FOR INFORMIX******************/
+   return 0;
+}
+
+int REV_SearchSubIdBySvcIdSeq( const void *p1, const void *p2 )
+{
+   ServiceCfg *pstL = (ServiceCfg *)p1;
+   ServiceCfg *pstR = (ServiceCfg *)p2;
+
+   if( pstL->iSvcId != pstR->iSvcId )
+   {
+      return pstL->iSvcId - pstR->iSvcId;
+   }
+   return pstL->iSubSeq - pstR->iSubSeq;
+}
+int SqlProcess( char *opczSql, int eiNode, const char *epczLValue, const char *epczRValue )
+{
+   char aczEnv[80];
+   char aczField[80];
+   char aczFieldType[10];
+   char aczSql[300];
+   char *p=NULL;
+
+   memset( aczEnv, 0, sizeof(aczEnv) );
+   sprintf( aczEnv, "NODE%d_%s", eiNode, epczLValue );
+   memset( aczField, 0, sizeof(aczField) );
+   p = getenv(aczEnv);
+   if( p != NULL )
+   {
+       strcpy( aczField, p );
+   }
+   if( strlen( aczField ) == 0 )
+   {
+       return 0;
+   }
+
+   p = NULL;
+   memset( aczEnv, 0, sizeof(aczEnv) );
+   sprintf( aczEnv, "_%s", aczField );
+   memset( aczFieldType, 0, sizeof(aczFieldType) );
+   p =  getenv(aczEnv) ;
+   if( p != NULL )
+   {
+       strcpy( aczFieldType, p );
+   }
+   if( strlen( opczSql ) > 0 )
+   {
+       strcat( opczSql, "," );
+   }
+
+   memset( aczSql, 0, sizeof(aczSql) );
+   switch( aczFieldType[0] )
+   {
+   case 'N':
+      sprintf( aczSql, " %s=%d ", aczField, atoi(epczRValue) );
+      break;
+   case 'F':
+      sprintf( aczSql, " %s=%.2f ", aczField, atof(epczRValue)/100 );
+      break;
+   default:
+      sprintf( aczSql, " %s='%s' ", aczField, epczRValue );
+      break;
+   }
+   strcat( opczSql, aczSql );
+
+   return 0;
+}
+
+int GetService( int eiChanId, char *epczTranCode, Service *opstServiceCfg )
+{
+   int  iTemp, iRowNum;
+   Service *pstService = NULL;
+
+   pcShmAddr = getShmAddr (giConfigKey);
+   if( pcShmAddr == NULL )
+   {
+      return -1;
+   }
+   iRowNum = 0;
+   pstService = (Service *)SHM_ReadData ( (void *)pcShmAddr, SERVICE, &iRowNum );
+   if( pstService == NULL )
+   {
+      return -1;
+   }
+
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if( pstService->iNodeId == eiChanId &&
+          strcmp( pstService->aczTranCode, epczTranCode ) == 0 )
+      {
+         *opstServiceCfg = *pstService;
+         return 0;
+      }
+      pstService++;
+   }
+
+   return 0;
+}
+
+int GetNodeCommCfg (int eiNodeId, NodeCommCfg *opstNodeCommCfg)
+{
+   int iRowNum=0, iTemp=0;
+   NodeCommCfg *pstNodeCommCfg;
+
+   pcShmAddr = getShmAddr (giConfigKey);
+   if( pcShmAddr == NULL )
+   {
+      return -1;
+   }
+   pstNodeCommCfg = (NodeCommCfg*)SHM_ReadData( pcShmAddr, NODECOMMCFG, &iRowNum );
+   if( pstNodeCommCfg == NULL )
+   {
+      return -1;
+   }
+   
+   for (iTemp = 0; iTemp < iRowNum; iTemp++)
+   {
+      if (pstNodeCommCfg->iNodeId == eiNodeId )
+      {
+         *opstNodeCommCfg = *pstNodeCommCfg;
+         return 0;
+      }
+      pstNodeCommCfg++;
+   }
+
+   return 0;
+}
+
+int SaveToDataBase( const char *epczBuf )
+{
+   EXEC SQL BEGIN DECLARE SECTION;
+   int  n;
+   char aczSql[2000]; 
+   char aczMachine[33];
+   char aczPan[32];
+   stChMonitor stMr;
+   stChMonitor stMrTmp;
+   stChMonitorInd stMrInd;
+   stChMonitorInd stMrIndTmp;
+   short nShortNameInd;
+   short nCodeInd;
+   short nMerInd;
+   EXEC SQL END DECLARE SECTION;
+
+   int  nNode = 0;
+   int  nNodeType = 0;
+   int  i=0;
+   char aczEnv[60]; 
+   char aczBuf[2000];
+   char aczLValue[200];
+   char aczRValue[200];
+   char *p, *q;
+   char *pValue, *pSep;
+   char *pNode;
+   char aczChNode[60];
+   Service stServiceCfg;
+   NodeCommCfg stNodeCfg;
+
+   memset( (char *)&stMr, 0, sizeof(stMr) );
+   memset( (char *)&stMrTmp, 0, sizeof(stMrTmp) );
+   memset( (char *)&stMrInd, 0, sizeof(stMrInd) );
+   memset( (char *)&stMrIndTmp, 0, sizeof(stMrIndTmp) );
+   memcpy( stMr.m_sPtDate, epczBuf, 8 );
+
+   memset( aczBuf, 0, sizeof(aczBuf) );
+   memcpy( aczBuf, epczBuf+8, 8 );
+   stMr.m_nPtSerial = atoi( aczBuf );
+
+   LOG4C((LOG_DEBUG, "SaveData Buf[%s]", epczBuf ));
+   /* 取节点编号 */   
+   if( (p = strchr( epczBuf, ',' )) == NULL )
+   {
+       LOG4C(( LOG_DEBUG, "1取节点编号出错" ));
+       return -1;
+   }
+   if( (q = strchr( p+1, ',' )) == NULL )
+   {
+       LOG4C(( LOG_DEBUG, "2取节点编号出错" ));
+       return -1;
+   }
+   memset( aczBuf, 0, sizeof(aczBuf) );
+   memcpy( aczBuf, p+1, q-p-1 ); 
+   nNode = atoi( aczBuf );
+   for( i=0; i<10; i++ )
+   {   
+      pNode = NULL;
+      memset( aczEnv, 0, sizeof(aczEnv) );
+      sprintf( aczEnv, "_NODE%d", i );
+      memset( aczChNode, 0, sizeof(aczChNode) );
+      pNode =  getenv(aczEnv) ;
+      if( pNode != NULL )
+      {
+          strcpy( aczChNode, pNode );
+      }
+      else
+      {
+          continue;
+      }
+      if( atoi(aczChNode) == nNode )
+      {
+          break;
+      } 
+   }
+   if( i<10 )/*渠道节点*/
+   { 
+      stMr.m_nChCode = nNode;
+      /*取节点名称*/
+      if( GetNodeCommCfg (stMr.m_nChCode, &stNodeCfg) != 0 )
+      {
+          LOG4C(( LOG_DEBUG, "1取节点名称错" ));
+          return -1;
+      }
+      strcpy( stMr.m_sChName, stNodeCfg.aczNodeName );
+      nNodeType = 0;
+   }
+   else
+   {
+      nNodeType = 1;
+   }
+
+   /* 取交易处理码 */
+   if( (p = strchr( q+1, ',' )) == NULL )
+   {
+       LOG4C(( LOG_DEBUG, "1取交易处理码错" ));
+       return -1;
+   }
+   if( nNodeType == 0 )/*渠道节点*/
+   {
+      memcpy( stMr.m_sChTxCode, q+1, p-q-1 ); 
+      /* 取交易名称 */  
+      if( GetService( stMr.m_nChCode, stMr.m_sChTxCode, &stServiceCfg ) != 0 )
+      {
+          LOG4C(( LOG_DEBUG, "1取交易名称错" ));
+          return -1;
+      }
+      strcpy( stMr.m_sChTxName, stServiceCfg.aczSvcName );
+   }
+   else
+   {
+      memcpy( stMr.m_sHoTxCode, q+1, p-q-1 );
+   }
+
+   /* 取发送标志 1=刚开始发送，2=结束发送*/
+   stMr.m_sCmdStatus[0] = *(++p); 
+
+   /* 取成功失败标志 0=没发起错误流程 1=发起错误流程 */
+   ++p; /*去掉,*/
+   stMr.m_sSuccFlag[0] = *(++p); 
+   
+   TOOL_GetSystemYYYYMMDD( stMr.m_sSysDate ); 
+   TOOL_GetSystemhhmmss( stMr.m_sSysTime ); 
+  
+   if( DataBaseConnect()!=0 )
+   {
+       LOG4C(( LOG_FATAL, "链接数据库出错" ));
+       return -1;
+   } 
+   
+   EXEC SQL SELECT count(*) INTO :n FROM ch_monitor 
+            WHERE pt_serial=:stMr.m_nPtSerial and pt_date=:stMr.m_sPtDate;
+   LOG4C(( LOG_DEBUG, "SELECT ch_monitor[%d][n=%d][%s][%d]", SQLCODE, n, stMr.m_sPtDate, stMr.m_nPtSerial ));
+   if( n==0 && SQLCODE==0 )
+   {
+      LOG4C(( LOG_DEBUG, "INSERT INTO ch_monitor FIRST" ));
+      EXEC SQL INSERT INTO ch_monitor values( :stMr );
+      if( SQLCODE )
+      {
+          LOG4C(( LOG_DEBUG, "INSERT[%d][n=%d]", SQLCODE, n ));
+          EXEC SQL COMMIT WORK RELEASE;
+          return -1;
+       }
+       EXEC SQL COMMIT WORK;
+   }
+   EXEC SQL SELECT * INTO :stMrTmp :stMrIndTmp FROM ch_monitor
+          WHERE pt_serial=:stMr.m_nPtSerial and pt_date=:stMr.m_sPtDate;
+
+   memset( aczBuf, 0, sizeof( aczBuf ));
+   if( nNodeType == 0 )/*渠道节点*/
+   {
+      if( stMrTmp.m_sCmdStatus[0] == '1' )/*1表示正在进行中的交易*/ 
+      {
+         sprintf( aczBuf, " cmd_status='%c',succ_flag='%c',ch_code=%d, ch_name='%s', ch_tx_code='%s', ch_tx_name='%s'",\
+            stMr.m_sCmdStatus[0], stMr.m_sSuccFlag[0] , stMr.m_nChCode, stMr.m_sChName,stMr.m_sChTxCode, stMr.m_sChTxName);
+      }
+      else /*2表示已经完成的交易*/
+      {
+         sprintf( aczBuf, " ch_code=%d, ch_name='%s', ch_tx_code='%s', ch_tx_name='%s'",\
+             stMr.m_nChCode, stMr.m_sChName,stMr.m_sChTxCode, stMr.m_sChTxName);
+      }
+   }
+   else
+   {
+      sprintf( aczBuf, " ho_tx_code='%s' ", stMr.m_sHoTxCode );
+   }
+   while( 1 )
+   {
+      if( (q = strchr( p+1, '\"' )) == NULL )
+      {
+          break;
+      }
+      if( (p = strchr( q+1, '\"' )) == NULL )
+      {
+          break;
+      }
+      pValue = (char *)malloc (p-q);
+      if (pValue == NULL )
+      {
+          break;
+      }
+      memset( pValue, 0, p-q );
+      memcpy( pValue, q+1, p-q-1 ); 
+      if( (pSep = strchr( pValue, '=' )) == NULL )
+      {
+          free( pValue );
+          break;
+      }
+      *pSep = 0;
+      memset( aczLValue, 0, sizeof(aczLValue) ); 
+      strcpy( aczLValue, pValue ); 
+      memset( aczRValue, 0, sizeof(aczRValue) ); 
+      strcpy( aczRValue, pSep+1 ); 
+      PUB_StrTrim( aczRValue, ' ' );
+      free( pValue );
+      SqlProcess( aczBuf, nNode, aczLValue, aczRValue );
+   }
+
+   /* 此处定义一个更新游标 */
+   EXEC SQL DECLARE up_monitor cursor FOR SELECT * From ch_monitor
+            WHERE pt_serial=:stMr.m_nPtSerial and pt_date=:stMr.m_sPtDate 
+              for update;
+   EXEC SQL OPEN up_monitor;
+   if( SQLCODE )
+   {
+       LOG4C(( LOG_DEBUG, "open UP_monitorERROR[%d]", SQLCODE));
+       EXEC SQL COMMIT WORK RELEASE;
+       return -1;
+   }  
+  
+   EXEC SQL FETCH up_monitor into :stMr :stMrInd;
+   if( SQLCODE )
+   {
+       LOG4C(( LOG_DEBUG, "fetch UP_monitorERROR[%d]", SQLCODE));
+       EXEC SQL CLOSE up_monitor;
+       EXEC SQL COMMIT WORK RELEASE;
+       return -1;
+   }  
+
+   memset( aczSql, 0, sizeof( aczSql ));
+   sprintf( aczSql, "UPDATE ch_monitor SET %s WHERE pt_serial=%d and pt_date='%s'",\
+                   aczBuf, stMr.m_nPtSerial, stMr.m_sPtDate );
+   LOG4C(( LOG_DEBUG, "aczSql[%s]", aczSql ));
+
+   EXEC SQL PREPARE up FROM :aczSql;
+   if( SQLCODE )
+   {
+       LOG4C(( LOG_DEBUG, "PREPARE UP aczSql ERROR[%d]", SQLCODE));
+       EXEC SQL CLOSE up_monitor;
+       EXEC SQL COMMIT WORK RELEASE;
+       return -1;
+   }
+   EXEC SQL EXECUTE up;
+   if( SQLCODE )
+   {
+       LOG4C(( LOG_DEBUG, "EXECUTE UP aczSql ERROR[%d]", SQLCODE));
+       EXEC SQL CLOSE up_monitor;
+       EXEC SQL COMMIT WORK RELEASE;
+       return -1;
+   }
+   LOG4C(( LOG_DEBUG, "execute update succ !!" ));
+   EXEC SQL COMMIT WORK;
+   /* 取商户名简称 */
+   EXEC SQL SELECT * INTO :stMr :stMrInd FROM ch_monitor
+          WHERE pt_serial=:stMr.m_nPtSerial and pt_date=:stMr.m_sPtDate;
+   if( SQLCODE )
+   {
+       LOG4C(( LOG_DEBUG, "SELECT CH_MONITOR ERROR[%d][%d][%s]", SQLCODE, stMr.m_nPtSerial, stMr.m_sPtDate));
+       EXEC SQL CLOSE up_monitor;
+       EXEC SQL COMMIT WORK RELEASE;
+       return -1;
+   } 
+   PUB_StrTrim( stMr.m_sShortName, ' ' );
+   if( strlen( stMr.m_sShortName ) == 0 )
+   {
+       PUB_StrTrim( stMr.m_sAcctNo, ' ' );
+       PUB_StrTrim( stMr.m_sAcctNo, 'F' );
+       EXEC SQL UPDATE ch_monitor SET acctno=:stMr.m_sAcctNo WHERE  current of up_monitor;
+
+       PUB_StrTrim( stMr.m_sMerchantId, ' ' );
+       PUB_StrTrim( stMr.m_sMachineId, ' ' );
+       PUB_StrTrim( stMr.m_sTerminalId, ' ' );
+       memset( aczMachine, 0, sizeof(aczMachine) );
+       strcpy( aczMachine, stMr.m_sMachineId+7 );
+       if( strlen( stMr.m_sMerchantId ) == 0 )
+       {
+           EXEC SQL SELECT code, merchant_code INTO :stMr.m_sTerminalId :nCodeInd, :stMr.m_sMerchantId :nMerInd 
+                     FROM terminal WHERE hardserial = :aczMachine;
+           PUB_StrTrim( stMr.m_sMerchantId, ' ' );
+           PUB_StrTrim( stMr.m_sTerminalId, ' ' );
+       }
+
+       EXEC SQL SELECT short_name INTO :stMr.m_sShortName :nShortNameInd FROM misMerchant
+                WHERE code = :stMr.m_sMerchantId; 
+       /* 无需判断查询结果
+       if( SQLCODE )
+       {
+           LOG4C(( LOG_DEBUG, "SELECT SHORTNAME ERROR [%d][%s]", SQLCODE, stMr.m_sMerchantId));
+           EXEC SQL CLOSE up_monitor;
+           EXEC SQL COMMIT WORK RELEASE;
+           return -1;
+       }*/
+       PUB_StrTrim( stMr.m_sShortName, ' ' );
+       EXEC SQL UPDATE ch_monitor SET short_name=:stMr.m_sShortName, merchant_id=:stMr.m_sMerchantId,
+                terminal_id = :stMr.m_sTerminalId ,machine_id=:aczMachine WHERE  current of up_monitor;
+       /* 无需判断查询结果
+       if( SQLCODE )
+       {
+           LOG4C(( LOG_DEBUG, "UPDATE CH_MONITOR ERROR ERROR[%d][%d][%s]", SQLCODE, stMr.m_nPtSerial, stMr.m_sPtDate));
+           EXEC SQL CLOSE up_monitor;
+           EXEC SQL COMMIT WORK RELEASE;
+           return -1;
+       }
+       */
+       LOG4C(( LOG_DEBUG, "UPDATE merchant short name succ[%s][%s][%s]", stMr.m_sShortName, stMr.m_sMerchantId,stMr.m_sTerminalId));
+       EXEC SQL COMMIT WORK;
+   }
+   
+   EXEC SQL CLOSE up_monitor;
+   EXEC SQL COMMIT WORK RELEASE;
+   return 0;
+}
+

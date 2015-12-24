@@ -1,0 +1,52 @@
+                              README
+
+结构
+--------
+  系统由三部分组成:
+  cmdsvr
+  nlmanager
+  anyhandle
+
+cmdsvr
+--------
+  命令管理器, 接收客户端命令并做相关的管理
+  现在支持的命令包括
+  start
+  stop
+  restart(调用 stop 再调用 stop)
+  report
+
+  命令行 cmdsvr config.xml
+  config.xml 参见 $HOME/etc/cmdsvr.xml
+  要求必须在 $HOME/etc 目录下有 cmdsvrlog.ini 文件
+
+nlmanager
+----------
+  管理子系统进程的进程
+  命令行 nlmanager name fd grpshmkey procshmkey index maxchild
+  name       是子系统名字, 系统将根据 name 在 $HOME/etc 下查找 name.xml配置文件
+             如果子系统有特殊的环境变量, 可在 $HOME/etc 下 name.env 文件中定义
+             如果没有 name.env 文件, 系统不做任何处理
+  fd         往 cmdsvr 返回信息的文件描述符, 命令行直接启动可填写为1(标准输出)
+  grpshmkey  是组管理器共享内存 KEY, 如果改 KEY 是 0 表示无
+             用于填写活动进程数, 最小进程数, 最大进程数, 端口, 管理进程 pid
+  procshmkey 是进程管理共享内存 KEY, 必须大于0
+  index      是改系统在组管理器中序号
+  maxchild   子系统最大进程数, 限制子系统最大进程数
+  要求必须在 $HOME/etc 目录下有 name.xml 文件
+
+anyhandle
+---------
+  业务处理进程
+  命令行 anyhandle name socket procshmkey cfgshmkey maxchild index offset loginit maxruntime nodeid
+  name        从 nlmanager 命令行传递
+  socket      nlmanager 产生的 socket
+  procshmkey  从 nlmanager 命令行传递
+  cfgshmkey   nlmanager 根据 $HOME/etc/name.xml 读出
+  maxchild    从 nlmanager 命令行传递, 本参数和下一个参数用于计算子进程偏移量
+  index       从 nlmanager 命令行传递
+  offset      nlmanager 计算产生
+  loginit     nlmanager 根据 $HOME/etc/name.xml 读出
+  maxruntime  最大运行次数
+  nodeid      节点号
+

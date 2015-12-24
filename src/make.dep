@@ -1,0 +1,65 @@
+APR_DIR      = $(MYROOT)/shlib
+APR_INCL_DIR = $(APR_DIR)/include/apr-1
+APR_LIB_DIR  = $(APR_DIR)/lib
+APR_LIB      = -L$(APR_LIB_DIR) -lapr-1
+
+XML2_DIR     = $(MYROOT)/shlib
+XML2_INCL_DIR= $(XML2_DIR)/include/libxml2
+XML2_LIB_DIR = $(XML2_DIR)/lib
+XML2_LIB     = -L$(XML2_LIB_DIR) -lxml2
+
+MYSQL_DIR    =  $(MYSQL_HOME)
+MYSQL_INCL_DIR = $(MYSQL_DIR)/include
+MYSQL_LIB_DIR  = $(MYSQL_DIR)/lib
+
+MSSQL_DIR   = $(SQLSERVERDIR)
+MSSQL_INCL_DIR = $(MSSQL_DIR)/include
+MSSQL_LIB_DIR  = $(MSSQL_DIR)/lib
+
+XLS_DIR 			= $(MYROOT)/libxls
+XLS_INCL_DIR  = $(XLS_DIR)/include
+XLS_LIB_DIR   = $(XLS_DIR)/lib
+
+XLS_LIB 			= -L$(XLS_LIB_DIR) -lxl
+
+
+GSOAP_INC_DIR  = $(GSOAP_HOME)/include
+GSOAP_LIB_DIR   = $(GSOAP_HOME)/lib
+
+
+
+CMP_BIN_DIR  = $(MYROOT)/bin
+CMP_LIB_DIR  = $(MYROOT)/lib
+CMP_INCL_DIR = $(MYROOT)/include
+ADP_INCL_DIR = $(MYROOT)/include/adp
+ASM_INCL_DIR = $(MYROOT)/include/asm
+PKG_INCL_DIR = $(MYROOT)/include/pkg
+QCLEAN_INCL_DIR = $(MYROOT)/include/qclean
+
+CMPLIBS=-L$(CMP_LIB_DIR)  -lstable -lcustom -lbase -lsecu -ltlv  -L/usr/lib -lpthread -lfl
+
+TUX_INCL_DIR = $(TUXDIR)/include
+TUX_LIB_DIR = $(TUXDIR)/lib
+TUX_LIB      = -L$(TUX_LIB_DIR) -ltux -lbuft -lfml -lfml32 -lengine -ldl -lpthread
+
+ISO8583_INCL_DIR = $(MYROOT)/include/iso8583
+ISO8583_LIB_DIR = $(MYROOT)/lib
+ISO8583_LIB      = -L$(ISO8583_LIB_DIR) -l8583
+
+
+ORACLE_LIB = -L$(ORACLE_HOME)/lib -lclntsh 
+INFORMIX_LIB=-L$(INFORMIXDIR)/lib -L$(INFORMIXDIR)/lib/esql -lifsql -lifasf -lifgen -lifos -lifgls -ldl $(INFORMIXDIR)/lib/esql/checkapi.o -lifglx
+
+CC=cc
+CXX=g++
+GCC=gcc
+EC=esql
+PROC = proc
+CFLAGS=-g 
+#CFLAGS=-g `pkg-config apr-1 --cflags`
+#CFLAGS=-g +DA2.0W +DD64
+#LDFLAGS=-g  +DD64
+
+INCPATH = -I$(CMP_INCL_DIR) -I$(APR_INCL_DIR) -I$(XML2_INCL_DIR) -I$(ADP_INCL_DIR) -I$(ASM_INCL_DIR) -I$(PKG_INCL_DIR) -I$(ISO8583_INCL_DIR) -I$(XLS_INCL_DIR)
+
+AR = ar rv

@@ -1,0 +1,575 @@
+#include <string.h>
+#include <sys/time.h>
+
+#include "log_udo.h"
+#include "tool_base.h"
+#include "tool_datetime.h"
+#include "log.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+int LOG_CfgCompare( const void *pstNode1, const void *pstNode2 )
+{
+   if(((MsgFldCfg *)pstNode1)->iMsgAppId == ((MsgFldCfg *)pstNode2)->iMsgAppId)
+   {
+      return ((MsgFldCfg *)pstNode1)->iFldSeq-((MsgFldCfg *)pstNode2)->iFldSeq;
+   }
+   return ((MsgFldCfg *)pstNode1)->iMsgAppId-((MsgFldCfg *)pstNode2)->iMsgAppId;
+}
+
+/*
+** 功能：根据渠道日志表组成创建空值UDO
+** 输入：1 渠道节点号
+**       2 服务信息
+** 输出：日志信息
+** 返回：0-成功，其他-失败
+*/
+int LOG_CreatLogUDO( int eiChnNodeId, SVC_Content *epstService, UDP opfLog )
+{
+   int iRowNum, iTemp, iFldSeq, iCurrOffset, iNextOffset;
+   NodeTranCfg *pstNodeTranCfg, stNodeTranCfg;
+   MsgFldCfg stMsgFldCfg, *pstMsgFldCfg, *pstMsgFldCfgTmp;
+   char *pTmp1, *pTmp2, *pTmp3;
+   int  iMsgAppId, iMsgAppNum = 0;
+   char aczMsgAppId[10], aczFldSeq[10], aczFldName[20];
+   int  iFlag = 0;
+
+   assert( epstService != NULL );
+   assert( opfLog      != NULL );
+
+   pstNodeTranCfg = NULL;
+   pstMsgFldCfg = NULL;
+   pstMsgFldCfgTmp = NULL;
+   
+
+   /*根据渠道节点号取交易日志表名和日志字段*/
+   memset( &stNodeTranCfg, 0x00, sizeof(stNodeTranCfg) );
+   iRowNum=0;
+   pstNodeTranCfg = (NodeTranCfg *)SHM_ReadData ( (void *)pcShmAddr,
+                                                  NODETRANCFG, &iRowNum);
+   if ( pstNodeTranCfg == NULL && iRowNum == -1 )
+   {
+      LOG4C (( LOG_FATAL, " 从共享内存读取数据失败 pcShmAddr:[%x]\n",
+                 pcShmAddr));
+      return -1;
+   }
+
+   if ( ( pstNodeTranCfg == NULL ) && ( iRowNum == 0 ) )
+   {
+      LOG4C (( LOG_FATAL, " 节点NodeId:[%d]在共享内存中无配置信息",
+                 eiChnNodeId ));
+      return -1;
+   }
+
+   for( iTemp = 0; iTemp < iRowNum; iTemp++ )
+   {
+      if ( pstNodeTranCfg->iNodeId == eiChnNodeId )
+      {
+         break; 
+      }
+      pstNodeTranCfg++;
+   }
+
+   if( iTemp == iRowNum )
+   {
+      LOG4C ((LOG_FATAL, "节点%d未定义", eiChnNodeId));
+      return LOG_NODE_NOT_DEF;
+   }
+
+   memcpy( &stNodeTranCfg, pstNodeTranCfg, sizeof(stNodeTranCfg) );
+
+   PUB_StrRightTrim( stNodeTranCfg.aczLogTabName, ' ' );
+   if( !strcmp( stNodeTranCfg.aczLogTabName, "" ) )
+   {
+      LOG4C ((LOG_WARN, "节点号%d日志表名未定义", eiChnNodeId));
+      return LOG_TABNAME_NOT_DEF;
+   }
+
+   /*将日志表名存放在链表1号节点*/
+   UDO_AddField( opfLog, 1, UDT_STRING, stNodeTranCfg.aczLogTabName, 
+                strlen( stNodeTranCfg.aczLogTabName ) );
+   PUB_StrTrim( stNodeTranCfg.aczLogFld, ' ' );
+   if( !strcmp( stNodeTranCfg.aczLogFld, "" ) )
+   {
+      LOG4C ((LOG_FATAL, "节点号%d日志域段未定义", eiChnNodeId));
+      return LOG_TABFLD_NOT_DEF;
+   }
+
+   pTmp1 = stNodeTranCfg.aczLogFld;
+   do
+   {
+      pTmp2 = strchr( pTmp1, ',' );
+      if( pTmp2 != NULL )
+      {
+         memset( aczMsgAppId, 0, 10 );
+         memset( aczFldSeq, 0, 10 );
+         memset( aczFldName, 0, 20 );
+         memcpy( aczFldName, pTmp1, pTmp2 - pTmp1 );
+         pTmp3= strchr( pTmp1, '_' );
+         if( pTmp3 != NULL )
+         {
+            pTmp1 = pTmp3 + 1;
+            pTmp3= strchr( pTmp1, '_' );
+            if( pTmp3 != NULL )
+            {
+               memcpy( aczMsgAppId, pTmp1, pTmp3 - pTmp1 );
+               pTmp1 = pTmp3 + 1;
+               pTmp3= strchr( pTmp1, '_' );
+               if( ( pTmp3 == NULL )||( pTmp3 > pTmp2 ) )
+               {
+                  pTmp3 = pTmp2;
+               }
+               memcpy( aczFldSeq, pTmp1, pTmp3 - pTmp1 );
+               pTmp1 = pTmp2 + 1;
+            }
+            else 
+            {
+               LOG4C ((LOG_FATAL, "日志域段配置错误,iChnNodeId=%d", eiChnNodeId));
+               return LOG_TABFLD_DEF_ERR;
+            }
+         }
+         else 
+         {
+            LOG4C ((LOG_FATAL, "日志域段配置错误,iChnNodeId=%d", eiChnNodeId));
+            return LOG_TABFLD_DEF_ERR;
+         }
+         iMsgAppId = atoi(aczMsgAppId); 
+         iFldSeq = atoi(aczFldSeq); 
+
+         /*根据报文应用号和字段序号进行折半查找*/
+         memset( &stMsgFldCfg, 0x00, sizeof( stMsgFldCfg ) );
+         stMsgFldCfg.iMsgAppId = iMsgAppId;
+         stMsgFldCfg.iFldSeq   = iFldSeq;
+
+         pstMsgFldCfg = (MsgFldCfg *)SHM_ReadData ( (void *)pcShmAddr,
+                                                    MSGFLDCFG, &iRowNum);
+         if ( pstMsgFldCfg == NULL && iRowNum == -1 )
+         {
+            LOG4C ((LOG_FATAL, " 从共享内存读取数据失败 pcShmAddr:[%x]\n",
+                       pcShmAddr));
+            return -1;
+         }
+      
+         if ( ( pstMsgFldCfg == NULL ) && ( iRowNum == 0 ) )
+         {
+            LOG4C ((LOG_FATAL, " MsgFldCfg在共享内存中无配置信息"));
+            return -1;
+         }
+         pstMsgFldCfgTmp = bsearch( (char*)&stMsgFldCfg,
+                                 pstMsgFldCfg,
+                                 iRowNum,
+                                 sizeof( MsgFldCfg ),
+                                 LOG_CfgCompare );
+
+
+         if( pstMsgFldCfgTmp == NULL )
+         {
+            LOG4C ((LOG_FATAL, "报文应用号%d域号%d在数据字典中未定义",
+                       iMsgAppId, iFldSeq));
+            return LOG_FLD_NOT_DEF;
+         }
+         
+         UDO_AddField( opfLog, 2, UDT_STRING, aczFldName, strlen(aczFldName) );
+                      /*日志表字段名*/
+         UDO_AddField( opfLog, 3, UDT_INT, (char *)&iMsgAppId, 0 );
+                      /*报文应用号*/
+         UDO_AddField( opfLog, 4, UDT_INT, (char *)&iFldSeq, 0 );
+                      /*对应报文应用域号*/
+         UDO_AddField( opfLog, 5, UDT_INT, (char *)&(pstMsgFldCfgTmp->iFldType), 0 );
+                      /*域数据类型*/
+         UDO_AddField( opfLog, 6, UDT_INT, (char *)&iFlag, 0 );
+                      /*标志，表示未进行修改*/
+         UDO_AddField( opfLog, 7, UDT_STRING, "", 0 );
+                      /*域值*/
+/***********************************
+         LOG4C ((LOG_DEBUG,
+                 "aczFldName=%s, iMsgAppId=%d, iFldSeq=%d, iFldType=%d, iFlag=%d",
+                 aczFldName, iMsgAppId, iFldSeq, pstMsgFldCfg->iFldType, iFlag));
+***********************************/
+      }
+/****************************************************
+      else 
+      {
+         LOG4C ((LOG_FATAl,  "日志域段配置错误,iChnNodeId=%d", eiChnNodeId));
+         return LOG_TABFLD_DEF_ERR;
+      }
+****************************************************/
+   }while( pTmp2 != NULL );
+
+
+   return LOG_SUCC;
+}
+
+/*
+** 功能：修改日志信息UDO
+** 输入：1 渠道节点号
+**       2 服务信息
+** 输出：日志信息
+** 返回：0-成功，其他-失败
+*/
+int LOG_ChgLogUDO( SUB_SvcList  *epstSubService, UDP eopfLog, int eiFlag )
+{
+   int     iRet, iCount, iTmp, iFldId, i, iOccur;
+   char    aczValue[ 1024 ], aczTmpValue[1024];
+   int     iFldSeq, iLen;
+   int     iMsgAppId, iFldType, iMsgAppId2;
+   UDP     pfList;
+   int     iFlag=1, iNextOffset[7], iCurrOffset[7];
+   short   shValue, *pshVal;
+   int     iValue, *piVal;
+   long    lValue, *plVal;
+   float   fValue, *pfVal;
+   double  dValue, *pdVal;
+
+   assert( epstSubService != NULL );
+   assert( eopfLog     != NULL );
+
+   if( eiFlag == 2 )
+   {
+      pfList = epstSubService->pfAnswList;
+   }
+   else if( eiFlag == 1 )
+   {
+      pfList = epstSubService->pfReqList;
+   }
+
+   if( pfList == NULL )
+   {
+      return -1;
+   }
+
+   iMsgAppId = epstSubService->iMsgAppId;
+   iCount = UDO_FieldCount( pfList );
+   for( iTmp = 0; iTmp < iCount; iTmp++ )
+   {
+      iRet = UDO_FieldId( pfList, iTmp, &iFldId );
+      if( iRet != 0 )
+      {
+         LOG4C ((LOG_FATAL, "UDO_FieldId Error iTmp[%d],iRet[%d]",
+                    iTmp, iRet));
+         return -1;
+      }
+
+      iOccur = UDO_FieldOccur( eopfLog, 3 );
+      for( i = 0; i < iOccur; i++ )
+      {
+         if( i == 0 )
+         {
+            UDO_GetFirstField( eopfLog, 3, (char *)&iMsgAppId2, 0,
+                              &iNextOffset[2] );
+         }
+         else
+         {
+            UDO_GetCurrField( eopfLog, iCurrOffset[2], (char *)&iMsgAppId2, 0,
+                             &iNextOffset[2] );
+         }
+         iCurrOffset[2] = iNextOffset[2];
+
+         /********************************************************
+         iRet = UDO_GetField( eopfLog, 3, i, (char *)&iMsgAppId2, 0 );
+         if( iRet != 0 )
+         {
+            LOG4C (( LOG_FATAL, "UDO_GetField Error i[%d]", i));
+            return -1;
+         }
+         ********************************************************/
+
+         if( i == 0 )
+         {
+            UDO_GetFirstField( eopfLog, 4, (char *)&iFldSeq, 0,
+                              &iNextOffset[3] );
+         }
+         else
+         {
+            UDO_GetCurrField( eopfLog, iCurrOffset[3], (char *)&iFldSeq, 0,
+                             &iNextOffset[3] );
+         }
+         iCurrOffset[3] = iNextOffset[3];
+
+         /********************************************************
+         iRet = UDO_GetField( eopfLog, 4, i, (char *)&iFldSeq, 0 );
+         if( iRet != 0 )
+         {
+            LOG4C (( LOG_FATAL, "UDO_GetField Error i[%d]", i));
+            return -1;
+         }
+         ********************************************************/
+
+         if( ( iFldId == iFldSeq )&&( iMsgAppId == iMsgAppId2 ) )
+         {
+            memset( aczValue, 0x00, sizeof(aczValue) );
+
+            iRet = UDO_GetField( eopfLog, 5, i, (char *)&iFldType, 0 );
+            if( iRet != 0 )
+            {
+               LOG4C (( LOG_FATAL, "UDO_GetField Error i[%d]", i));
+               return -1;
+            }
+
+            /**********************************************************
+            iRet = UDO_GetField( pfList, iFldId, 0, aczValue, &iLen );
+            ***********************************************************/
+            iRet = UDO_SafeGetField( pfList, iFldId, 0, iFldType,
+                                    aczValue, &iLen );
+            if( iRet != 0 )
+            {
+               LOG4C (( LOG_FATAL, "UDO_GetField Error iFldId[%d]", iFldId));
+               return -1;
+            }
+
+            iRet = UDO_ChgField( eopfLog, 6, i, (char *)&iFlag, 0 );
+            if( iRet != 0 )
+            {
+               LOG4C (( LOG_FATAL, "UDO_GetField Error i[%d]", i));
+               return -1;
+            }
+
+            iRet = UDO_ChgField( eopfLog, 7, i, aczValue, iLen );
+            if( iRet != 0 )
+            {
+               LOG4C (( LOG_FATAL, "UDO_ChgField Error i[%d]", iRet));
+               return -1;
+            }
+         }
+      }
+
+   }
+
+
+   return LOG_SUCC;
+}
+
+/*
+** 功能：根据日志信息生成Sql语句，记交易日志
+** 输入：1 服务信息
+**       2 日志信息
+** 输出：无
+** 返回：0-成功，其他-失败
+*/
+int LOG_Write( SVC_Content * epstService, UDP epfLog, int eiSuccFlag )
+{
+   SUB_SvcList *pstSubService;
+   char     aczTabName[ 40 ];
+   char     aczFldNames[ 10240 ];
+   char     aczFldValues[ 10240 ];
+   char     aczTranPath[ 41 ];
+   char     aczAxpTranCode[41];
+   char     aczSerial[41];
+   int      iOccur;
+   int      i, iRet, iSubSeq, iSvcId;
+   int      iFlag, iFldType, iCurrOffset[7], iNextOffset[7];
+   char     aczFldName[ 40 ];
+   char     aczValue[ 1024 ];
+   short    shValue, *pshVal;
+   long     lValue, *plVal;
+   int      iValue, *piVal;
+   float    fValue, *pfVal;
+   double   dValue, *pdVal;
+
+   EXEC SQL BEGIN DECLARE SECTION;
+      char aczStatement[ 4096 ];
+      char aczTranDate[9];
+   EXEC SQL END DECLARE SECTION;
+
+
+   if( epstService == NULL || epfLog == NULL )
+   {
+      LOG4C ((LOG_FATAL, " 输入参数为空"));
+      return -1;
+   }
+
+
+   memset( aczFldNames, 0x00, sizeof(aczFldNames) );
+   memset( aczFldValues, 0x00, sizeof(aczFldValues) );
+   memset( aczValue, 0x00, sizeof(aczValue) );
+   memset( aczStatement, 0x00, sizeof(aczStatement) );
+   memset( aczTranPath, 0x00, sizeof(aczTranPath) );
+
+   iSvcId = epstService->iSvcId;
+   iSubSeq = epstService->pstSubSvcTail->iSubSvcSeq;
+   if( iSubSeq < 0 )
+   {
+      for( pstSubService = &(epstService->stSubSvcHead);
+           pstSubService != NULL;
+           pstSubService = pstSubService->pstNextSubSvc )
+      {
+         if( pstSubService->pstNextSubSvc == epstService->pstSubSvcTail )
+            break;
+      }
+      if( pstSubService == NULL )
+      {
+         LOG4C ((LOG_FATAL, " 定位子服务信息链表错误"));
+         return -1;
+      }
+      iSubSeq = pstSubService->iSubSvcSeq;
+   }
+   for( pstSubService = &(epstService->stSubSvcHead);
+        pstSubService != NULL;
+        pstSubService = pstSubService->pstNextSubSvc )
+   {
+      if( pstSubService->iErrorHandleType == 1 )
+      {
+         sprintf( aczTranPath, "%s%d,", aczTranPath, 
+                  pstSubService->iSubSvcSeq );
+      }
+   }
+
+   memset( aczTabName, 0x00, sizeof(aczTabName) );
+   UDO_GetField( epfLog, 1, 0, aczTabName, 0 );
+   
+   iOccur = UDO_FieldOccur( epfLog, 3 );
+   for( i = 0; i<iOccur; i++ )
+   {
+      if( i == 0 )
+      {
+         UDO_GetFirstField( epfLog, 6, (char *)&iFlag, 0, &iNextOffset[5] );
+      }
+      else
+      {
+         UDO_GetCurrField( epfLog, iCurrOffset[5], (char *)&iFlag, 0,
+                          &iNextOffset[5] );
+      }
+      iCurrOffset[5] = iNextOffset[5];
+      /********************************************************
+      iRet = UDO_GetField( epfLog, 6, i, (char *)&iFlag, 0 );
+      ********************************************************/
+      memset( aczValue, 0x00, sizeof(aczValue) );
+      if( i == 0 )
+      {
+         UDO_GetFirstField( epfLog, 7, aczValue, 0, &iNextOffset[6] );
+         UDO_GetFirstField( epfLog, 5, (char *)&iFldType, 0,
+                           &iNextOffset[4] );
+      }
+      else
+      {
+         UDO_GetCurrField( epfLog, iCurrOffset[6], aczValue, 0,
+                          &iNextOffset[6] );
+         UDO_GetCurrField( epfLog, iCurrOffset[4], (char *)&iFldType, 0,
+                          &iNextOffset[4] );
+      }
+      iCurrOffset[6] = iNextOffset[6];
+      iCurrOffset[4] = iNextOffset[4];
+      /******************************************************
+      UDO_GetField( epfLog, 7, i, aczValue, 0 );
+      UDO_GetField( epfLog, 5, i, (char *)&iFldType, 0 );
+      ******************************************************/
+      if( iFlag == 1 )
+      {
+         switch( iFldType )
+         {
+         case UDT_STRING:
+            sprintf( aczFldValues, "%s'%s',", aczFldValues, aczValue );
+            break;
+         case UDT_SHORT:
+            pshVal = (short *)aczValue;
+            shValue = *pshVal;
+            sprintf( aczFldValues, "%s%d,", aczFldValues, shValue );
+            break;
+         case UDT_INT:
+            piVal = (int *)aczValue;
+            iValue = *piVal;
+            sprintf( aczFldValues, "%s%d,", aczFldValues, iValue );
+            break;
+         case UDT_LONG:
+            plVal = (long *)aczValue;
+            lValue = *plVal;
+            sprintf( aczFldValues, "%s%ld,", aczFldValues, lValue );
+            break;
+         case UDT_FLOAT:
+            pfVal = (float *)aczValue;
+            fValue = *pfVal;
+            sprintf( aczFldValues, "%s%f,", aczFldValues, fValue );
+            break;
+         case UDT_DOUBLE:
+            pdVal = (double *)aczValue;
+            dValue = *pdVal;
+            sprintf( aczFldValues, "%s%lf,", aczFldValues, dValue );
+            break;
+         default:
+            LOG4C ((LOG_FATAL, " 错误的数据类型%d", iFldType ));
+            return LOG_ERR_TYPE;
+         }
+         memset( aczFldName, 0x00, sizeof(aczFldName) );
+         UDO_GetField( epfLog, 2, i, aczFldName, 0 );
+         sprintf( aczFldNames,"%s%s,", aczFldNames, aczFldName );
+      }
+   }
+   PUB_StrRightTrim( aczFldNames, ',' );
+   PUB_StrRightTrim( aczFldValues, ',' );
+
+   memset( aczTranDate, 0, sizeof(aczTranDate) );
+   TOOL_GetSystemYYYYMMDD( aczTranDate );
+   
+   if( strlen(aczFldNames) != 0 )
+   {
+      memset (aczAxpTranCode, 0, sizeof (aczAxpTranCode));
+      memset (aczSerial, 0, sizeof (aczSerial));
+      getString ("txcode", aczAxpTranCode);
+      getString ("agserial", aczSerial);
+      sprintf( aczStatement,
+               "insert into %s (sys_serial,trandate,svcid,succflag,tranpath,trancode,%s) values (%s,'%s',%d,%d,'%s','%s',%s)", 
+               aczTabName, aczFldNames, 
+   	    aczSerial, aczTranDate, iSvcId, eiSuccFlag, aczTranPath, aczAxpTranCode, aczFldValues );
+   
+      EXEC SQL PREPARE insert1 FROM :aczStatement;
+      if( sqlca.sqlcode != 0 )
+      {
+         LOG4C ((LOG_FATAL, " database error, sqlcode[%d]", sqlca.sqlcode));
+         return -1;
+      }
+   
+      EXEC SQL EXECUTE insert1;
+      if( sqlca.sqlcode != 0 )
+      {
+         LOG4C ((LOG_FATAL, " database error, sqlcode[%d]", sqlca.sqlcode));
+         return -1;
+      }
+
+      EXEC SQL COMMIT WORK;
+   }
+
+   return LOG_SUCC;
+}
+
+
+/*
+** 记渠道流水
+*/
+int LOG_WriteTranLog( SVC_Content *epstService, int eiSuccFlag )
+{
+   int iRet;
+   SUB_SvcList  *pstSubService = NULL;
+   
+   /*创建交易要素日志链表*/
+   iRet = LOG_CreatLogUDO( epstService->iChannelId, epstService, epstService->pfLogList );
+   if( iRet != 0 )
+   {
+      if (iRet != LOG_TABNAME_NOT_DEF) {
+          LOG4C (( LOG_FATAL, "LOG_CreatLogUDO error"));
+      }
+      return -1;
+   }
+
+   for( pstSubService = &(epstService->stSubSvcHead); pstSubService != NULL; pstSubService=pstSubService->pstNextSubSvc )
+   {
+      if( pstSubService != &(epstService->stSubSvcHead) )
+      {
+         LOG_ChgLogUDO( pstSubService, epstService->pfLogList, 1 );
+      }
+
+      if( pstSubService != epstService->pstSubSvcTail )
+      {
+         LOG_ChgLogUDO( pstSubService, epstService->pfLogList, 2 );
+      }
+   }
+
+   iRet = LOG_Write( epstService, epstService->pfLogList, eiSuccFlag );
+   if( iRet != 0 )
+   {
+      LOG4C (( LOG_FATAL, "LOG_Write error"));
+      return -1;
+   }
+}
+/*
+** end of file
+*/

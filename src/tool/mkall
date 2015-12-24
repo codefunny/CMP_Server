@@ -1,0 +1,22 @@
+for dirs in *
+do
+   if [ -d $dirs ]; then
+      cd $dirs
+           if [ -f makefile ]; then
+                echo "-------------------- 开始编译["$dirs"] --------------------"
+                make clean
+                make
+                if [ $? != 0 ]; then
+                echo "----------------- 编译失败["$dirs"]退出--------------------"
+                    break
+                fi
+                echo "-------------------- 编译成功["$dirs"] --------------------"
+                echo " "
+                echo " "
+                sleep 1
+                cd ../
+           else
+             cd ../
+           fi
+   fi
+done

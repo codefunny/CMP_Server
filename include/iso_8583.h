@@ -1,0 +1,70 @@
+#ifndef ISO8583_H
+#define ISO8583_H
+
+#define ISO_MSGTYPE               0     /* 信息类型 */
+#define ISO_BITMAP                1     /* 基本位图和扩展位图 */
+#define ISO_PAN                   2     /* 主帐号 */
+#define ISO_PROCCODE              3     /* 处理代码 */
+#define ISO_TRANAMOUNT            4     /* 交易金额 */
+#define ISO_TRANDATETIME          7     /* 交易日期和时间 */
+#define ISO_SYSTRACE              11    /* 系统跟踪号 */
+#define ISO_LOCALTRANTIME         12    /* 本地交易时间 */
+#define ISO_LOCALTRANDATE         13    /* 本地交易日期 */
+#define ISO_EXPDATE               14    /* 有效期 */
+#define ISO_SETTLEDATE            15    /* 结算日期 */
+#define ISO_CAPTUREDATE           17    /* 获取日期 */
+#define ISO_MERCHANTTYPE          18    /* 商户类型 */
+#define ISO_POSENTRYMODE          22    /* 服务点输入方式 */
+#define ISO_POSCONDCODE           25    /* 服务点条件代码 */
+#define ISO_ACQIDEN               32    /* 收单机构标识码 */
+#define ISO_FWDIDEN               33    /* 授权机构标识码 */
+#define ISO_TRK2DATA              35    /* 二磁道数据 */
+#define ISO_TRK3DATA              36    /* 三磁道数据 */
+#define ISO_REFNUMBER             37    /* 检索索引号 */
+#define ISO_AUTHCODE              38    /* 授权码 */
+#define ISO_RSPCODE               39    /* 返回码 */
+#define ISO_ACCEPTERMIDEN         41    /* 收卡单位终端标识码 */
+#define ISO_ACCEPIDENCODE         42    /* 收卡商户定义码 */
+#define ISO_ACCEPLOCATION         43    /* 收卡商户位置 */
+#define ISO_ADDRSPDATA            44    /* 附加返回数据 */
+#define ISO_ADDPRIVDATA           48    /* 附加数据-私用 */
+#define ISO_CURRCODE              49    /* 交易货币代码 */
+#define ISO_SETTLECURRCODE        50    /* 结算货币代码 */
+#define ISO_PIN                   52    /* 用户密码 */
+#define ISO_SECCTRL               53    /* 密码相关控制信息 */
+#define ISO_ADDAMOUNT             54    /* 附加金额 */
+#define ISO_FIELD60               60    /* 60号域 */
+#define ISO_FIELD61               61    /* 61号域 */
+#define ISO_FIELD62               62    /* 62号域 */
+#define ISO_FIELD63               63    /* 63号域 */
+#define ISO_MAC                   64    /* 信息确认码 */
+#define ISO_MGRINFOCODE           70    /* 管理信息码 */
+#define ISO_CTRANNUM              74    /* 贷记交易笔数 */
+#define ISO_CREVTRANNUM           75    /* 贷记自动冲正交易笔数 */
+#define ISO_DTRANNUM              76    /* 借记交易笔数 */
+#define ISO_DREVTRANNUM           77    /* 借记自动冲正交易笔数 */
+#define ISO_TRANSNUM              78    /* 转帐交易笔数 */
+#define ISO_TRANSREVNUM           79    /* 转帐自动冲正交易笔数 */
+#define ISO_INQNUM                80    /* 查询交易笔数 */
+#define ISO_AUTHTRANNUM           81    /* 授权交易笔数 */
+#define ISO_CTRANSFEE             83    /* 贷记交易费金额 */
+#define ISO_DTRANFEE              85    /* 借记交易费金额 */
+#define ISO_CTRANAMOUNT           86    /* 贷记交易金额 */
+#define ISO_CREVTRANAMT           87    /* 贷记自动冲正金额 */
+#define ISO_DTRANAMOUNT           88    /* 借记交易金额 */
+#define ISO_DREVTRANAMT           89    /* 借记自动冲正交易金额 */
+#define ISO_ORGDATA               90    /* 原交易的数据元素 */
+#define ISO_FILEUPTCODE           91    /* 文件修改编码 */
+#define ISO_SVCINDIC              94    /* 服务指示码 */
+#define ISO_REPLAMT               95    /* 代替金额 */
+#define ISO_NETSETTLEAMT          97    /* 净结算金额 */
+#define ISO_SETTLEIDEN            99    /* 结算机构码 */
+#define ISO_RECVIDEN              100   /* 接收机构码 */
+#define ISO_FILENAME              101   /* 文件名 */
+#define ISO_ACCT1                 102   /* 帐号1 */
+#define ISO_ACCT2                 103   /* 帐号2 */
+#define ISO_NEWPIN                123   /* 新密码数据 */
+#define ISO_MAC2                  124   /* 信息确认码 */
+
+
+#endif /*ISO8583_H*/

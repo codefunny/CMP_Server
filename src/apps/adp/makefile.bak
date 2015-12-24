@@ -1,0 +1,39 @@
+include $(MYROOT)/src/make.dep
+
+FLAG=-I/usr/local/include
+
+INCL=-I$(TUXDIR)/include
+
+all: $(CMP_LIB_DIR)/libcustom.a
+
+OBJS = adp_base.o  adp_client.o adp_calladp.o \
+       adp_reverse.o pt_database.o adp_tochannel.o adp_toother.o adp_toallinpay.o\
+       adp_topos.o adp_toterm.o  adp_toyacol.o adp_tobankcomm.o  adp_tomiteno.o adp_control.o \
+
+$(CMP_LIB_DIR)/libcustom.a: $(OBJS) 
+	$(AR) $@ $(OBJS)
+
+.SUFFIXES:.ecpp .ec .cpp .pc
+
+.pc.o:
+	$(PROC) DEFINE=_LARGEFILE64_SOURCE INCLUDE=$(CMP_INCL_DIR) INCLUDE=$(APR_INCL_DIR) sqlcheck=SYNTAX userid=$(DBUSER)/$(DBPASS) DEF_SQLCODE=YES PARSE=NO iname=$*.pc oname=$*.c
+	$(CC) -D_LARGEFILE64_SOURCE $(CFLAGS) $(FLAG) -I. $(INCPATH) -I$(ORACLE_HOME)/include -g -c $*.c
+	rm -f $*.c $*.lis
+
+.ecpp.o:
+	$(EC) $(CFLAGS) $(FLAG) $(INCPATH) $? -c
+	rm -f $*.C
+
+.ec.o:
+	$(EC) $(CFLAGS) $(FLAG) $(INCPATH) $? -c
+	rm -f $*.c
+
+.cpp.o:
+	$(GCC) $(CFLAGS) $(FLAG) $(INCPATH) -c $<
+
+.c.o:
+	$(CC) $(CFLAGS) $(FLAG) $(INCL) $(INCPATH) -c $<
+
+clean:
+	rm -f *.o
+	rm -f tp*

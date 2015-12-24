@@ -1,0 +1,206 @@
+#include "adp/adp_base.h"
+#include "adp/adp_topos.h"
+#include "pkg/pkg_api.h"
+#include "log.h"
+#include "hsm30.h"
+
+EXEC SQL include sqlca;
+
+int GetOtherMacKey( char *opczKey )
+{
+   EXEC SQL BEGIN DECLARE SECTION;
+       char aczMacKey[33];
+       short  shInd;
+   EXEC SQL END   DECLARE SECTION;
+
+   memset( aczMacKey, 0x00, sizeof(aczMacKey) );
+
+   EXEC SQL SELECT  mackey into :aczMacKey :shInd  
+            FROM visa_info_ext 
+            WHERE pro_code='104' AND unit_code='104-01';
+
+   if (SQLCODE)
+   {
+       LOG4C(( LOG_FATAL, "计算MAC错误SQLCODE=[%d]", SQLCODE  ));
+       return -1;
+   }
+
+   //DecryptKey( opczKey, aczMacKey );
+   //DecryptKey( opczKey+8, aczMacKey+16 );
+   TOOL_ConvertAscii2BCD( aczMacKey, opczKey, 32 );
+
+   return 0;
+}
+
+int GenOtherMac( char * epczBuf, int enLen )
+{
+   unsigned char aczKey[17];
+   unsigned char aczMac[17];
+   int  i=0;
+   ST_HSM30_GENERATE_MAC_IN  stIn;
+   ST_HSM30_GENERATE_MAC_OUT  stOut;
+   char  aczHsmIp[20];
+   int   nHsmPort=0;
+   int   nKeyIndex=0;
+   char  *p=NULL;
+   int   nRet=0;
+
+   memset( aczKey, 0, sizeof(aczKey) );
+   memset( aczMac, 0, sizeof(aczMac) );
+   memset( aczHsmIp, 0, sizeof(aczHsmIp) );
+   memset( &stIn, 0, sizeof( ST_HSM30_GENERATE_MAC_IN ) );
+   memset( &stOut, 0, sizeof( ST_HSM30_GENERATE_MAC_OUT ) );
+
+   if ( GetOtherMacKey( aczKey ) != 0 )
+   {
+       LOG4C(( LOG_FATAL, "GET MAC KEY FAIL" ));
+       return -1;
+   }
+
+   if( (p=getenv("KEY_DEV_IP")) != NULL )
+   {
+       strcpy( aczHsmIp, p );
+   }
+
+   if( (p=getenv("KEY_DEV_PORT")) != NULL )
+   {
+       nHsmPort = atoi( p );
+   }
+
+   if( (p=getenv("KEYINDEX")) != NULL )
+   {
+       nKeyIndex = atoi( p );
+   }
+
+LOG4C(( LOG_DEBUG, "GenOhterMac Len[%d]", enLen ));
+   strcpy( stIn.uszHostIP, aczHsmIp );
+   stIn.unPort = nHsmPort;
+   stIn.unZmkIndex = nKeyIndex;
+   //stIn.ucMacKeyLen = 16;
+   //memcpy( stIn.uszMacKey, aczKey , 16 );
+   stIn.ucMacKeyLen = 8;
+   memcpy( stIn.uszMacKey, aczKey , 8 );
+
+   stIn.unDataLen = enLen;
+   memcpy( stIn.usData, epczBuf , stIn.unDataLen );
+
+   nRet = Hsm30_GenerateMAC( &stIn, &stOut );
+   if( nRet != 0 )
+   {
+       LOG4C(( LOG_FATAL, "计算MAC错误" ));
+       return -1;
+   }
+
+   TOOL_ConvertBCD2Ascii( stOut.uszMac, 16, aczMac );
+
+   memcpy( epczBuf+enLen, aczMac, 8 );
+
+   return 0;
+}
+
+/*
+**说明:本函数用于往柜台渠道发正确响应
+**渠道返回适配器基本步骤:
+**
+**1 准备打包需要的数据,包含打包的函数ID,配置的交易代码等信息,
+**  一般调用 ADP_GetChanPkgNeedInfo
+**
+**2 根据交易代码和报文标志查找该交易的报文字段配置信息,
+**  一般调用 PKG_GetInfoByTranCode
+**
+**3 调用打包函数打包
+**  一般调用 PKG_ToMsg
+**
+**4 调用渠道返回函数, 将数据返回到渠道
+**  一般调用 COM_SendBuffer
+*/
+int  ADP_ToOther( int eiSubID,    int eiSubSeq,
+                       UDP epfReqList, UDP opfRspList,
+                       SVC_Content   * epstService )
+{
+   char aczSendBuf[5000];
+   int iRet, iLstId, iSendLen;
+   PkgNeedInfo stPkgNeedInfo;
+   MsgFldCfgAry stMsgFldCfgAry;
+   SUB_SvcList *pstSubSvcCfg;
+   char aczHostNodeId[10];
+   char *pTmp1, *pTmp2;
+   int iAsmRetCodeFlag=0;
+   int iChanNodeId;
+   int iToMidTranCodeId, iToMsgTranCodeId, iToMidId, iToMsgId;
+   unsigned char aczBitMap[17];
+
+   iChanNodeId = epstService->iChannelId;
+
+   iLstId = epstService->pstSubSvcCurr->iLstId;
+   /*iLstId =2;*/
+   pstSubSvcCfg = epstService->pstSubSvcCurr;
+
+   iRet = ADP_GetChanPkgNeedInfo(epstService->iSvcId, eiSubID, &stPkgNeedInfo);
+   if( iRet != 0 )
+   {
+      sprintf( epstService->aczErrorMessage,
+               "%d in %s get the package need information error %d",
+               __LINE__, __FILE__, iRet );
+      LOG4C(( LOG_FATAL, "get the package need information error %d", iRet ));
+      return ADP_GPNI_ERR;
+   }
+   memset( &stMsgFldCfgAry, 0x00, sizeof(stMsgFldCfgAry) );
+   iRet = PKG_GetInfoByTranCode( epstService->iChannelId, 
+                                 stPkgNeedInfo.aczTranCode, iLstId,
+                                 &stMsgFldCfgAry );
+   if( iRet != 0 )
+   {
+      sprintf( epstService->aczErrorMessage,
+               "取报文%d域配置出错",
+               stPkgNeedInfo.iPkgAppId );
+      LOG4C(( LOG_FATAL, epstService->aczErrorMessage ));
+
+      return ADP_GIFMFC_ERR;
+   }
+
+   iRet = PKG_GetFunId( iChanNodeId, &iToMidTranCodeId, &iToMsgTranCodeId,
+                        &iToMidId, &iToMsgId );
+   if( iRet != 0 )
+   {
+      sprintf( epstService->aczErrorMessage, "%d取报文组包函数域配置出错", iChanNodeId );
+      LOG4C(( LOG_FATAL, epstService->aczErrorMessage ));
+      return ADP_GIFMFC_ERR;
+   }
+
+
+   memset( aczSendBuf, 0, sizeof(aczSendBuf) );
+   iRet = PKG_ToMsg( iToMsgId, aczSendBuf, &iSendLen,
+                     stPkgNeedInfo.iNodeId, stPkgNeedInfo.aczTranCode,
+                     iLstId, &stMsgFldCfgAry, epfReqList );
+   free( stMsgFldCfgAry.pstMsgFldCfg );
+   if( iRet != 0 )
+   {
+      sprintf( epstService->aczErrorMessage,
+               "%d in %s子服务%d打包出错,交易代码%s,返回%d",
+               __LINE__, __FILE__, eiSubID, stPkgNeedInfo.aczTranCode, iRet );
+      LOG4C(( LOG_FATAL, epstService->aczErrorMessage ));
+
+      return ADP_PKGTOMSG_ERR;
+   }
+   
+   memset( aczBitMap, 0, sizeof(aczBitMap) );
+   UDO_GetField( epfReqList, 1, 0, aczBitMap, 0 );
+
+   LOG4C(( LOG_DEBUG,"BITMAP [%02X %02X %02X %02X %02X %02X %02X %02X]",
+               aczBitMap[0]&0xff, aczBitMap[1]&0xff, aczBitMap[2]&0xff,aczBitMap[3]&0xff,
+               aczBitMap[4]&0xff, aczBitMap[5]&0xff, aczBitMap[6]&0xff,aczBitMap[7]&0xff ));
+   
+   if( aczBitMap[7] & 0x01 )
+   {
+       GenOtherMac( aczSendBuf+6, iSendLen-6-8 );
+   }
+
+   if( sendBuffer( aczSendBuf, iSendLen ) == -1 )
+   {
+      LOG4C(( LOG_FATAL, "往渠道返回信息出错%s", strerror(errno) ));
+      return -1;
+   }
+
+   return 0;
+}

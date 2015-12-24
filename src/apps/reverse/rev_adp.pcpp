@@ -1,0 +1,71 @@
+#include <string.h>
+#include <memory.h>
+
+#include "adp.h"
+#include "udo.h"
+#include "log.h"
+
+EXEC SQL include "reverse/rev_fun.h";
+
+/**
+  * ADP主机适配器
+  */
+const static int RET_CODE = 97;
+int REV_AdpTrans( char *epczHostIp, int eiPort, char *transName, char *tranCode, UDP pfReq )
+{
+   char acRevRsp[4096], aczRetCode[100];
+   int iRet;
+   AdpClient adpClient( epczHostIp, eiPort );
+
+   UDO_Init( acRevRsp, sizeof(acRevRsp) );
+   LOG4C(( LOG_INFO, "connect : %s-%d", epczHostIp, eiPort ));
+   adpClient.init( "system" );
+   iRet = adpClient.call( transName, "000000", pfReq, acRevRsp, 30 );
+   if( iRet != 0 )
+   {
+      LOG4C(( LOG_INFO, "ADP主机 (%s-%d) call 返回 %d",
+              epczHostIp, eiPort, iRet ));
+      return -1;
+   }
+
+   memset( aczRetCode, 0, sizeof(aczRetCode) );
+   UDO_GetField( acRevRsp, RET_CODE, 0, aczRetCode, 0 );
+   UDO_Free( acRevRsp );
+
+   LOG4C(( LOG_INFO, "ADP主机 (%s-%d) 返回码 [%s]",
+           epczHostIp, eiPort, aczRetCode ));
+   if( strcmp( aczRetCode, "000000000" ) == 0 )
+   {
+      return 0;
+   }
+   return -1;
+}
+
+/**
+  * ADP主机节点冲正适配器
+  */
+int REV_AdpHost( int eiRevSerial, int eiSubId, UDP pfReq, RevRecord *pstRevRecord )
+{
+   NodeCommCfg *pstNodeComm;
+   SubService  *pstSubService;
+   /**
+     * 首先查找主机对应节点的通信属性
+     */
+   pstNodeComm = REV_SearchNodeCommCfgBySubId( eiSubId );
+   if( pstNodeComm == NULL )
+   {
+      LOG4C(( LOG_FATAL, "查子服务 %d 通信节点失败", eiSubId ));
+      return -1;
+   }
+
+   /**
+     * 前面已经访问过该子服务, 此处肯定不会出错
+     */
+   pstSubService = REV_SearchSubService( eiSubId );
+
+   return REV_AdpTrans( pstNodeComm->aczHostIp,
+                        pstNodeComm->iHostCommPort,
+                        pstSubService->aczNotes,
+                        pstSubService->aczTranCode,
+                        pfReq );
+}

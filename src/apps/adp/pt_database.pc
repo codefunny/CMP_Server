@@ -1,0 +1,160 @@
+/*****************************************************************
+*
+*    Copyright (C), 2010-2020, NewLand Computer Co., Ltd.
+*    Version:  VER1.0
+*    Description: CMP平台的数据库操作
+*    History:
+*
+*    Function List:
+*          getPtSerialDate : 取平台流水和交易平台日期
+*          getOperCodeParam:
+*
+*    date:   2010-7-20
+*    author: zhou hong di
+*    created: zhou hong di
+*
+*    date:
+*    author:
+*    modify description
+*
+*****************************************************************/
+#include <assert.h>
+#include <stdio.h>
+
+#include "global.h"
+#include "tool_base.h"
+#include "log.h"
+
+#define SQLNOTFOUND -1403
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+int getPtSerialDate( long *oplSerial, char *opczWorkDate );
+
+#ifdef __cplusplus
+}
+#endif
+
+EXEC SQL include sqlca;
+
+/*
+ *
+ * Function: getPtSerialDate
+ * Description: 取平台流水和交易平台日期
+ * Input:
+ * Output:
+ *         oplSerial - 平台流水
+ *         opczWorkDate - 平台日期
+ * Return:
+ * Other:
+ *
+ */
+int getPtSerialDate( long *oplSerial, char *opczWorkDate )
+{
+   EXEC SQL BEGIN DECLARE SECTION;
+       long lCurSerial;
+       long lNewSerial;
+       char aczWorkDate[9];
+       char aczLastDate[9];
+       char aczNextDate[9];
+   EXEC SQL END   DECLARE SECTION;
+
+   time_t tTime;
+   struct tm *pstTime;
+
+   if( opczWorkDate == NULL )
+   {
+       LOG4C(( LOG_FATAL, "opczWorkDate输入参数为空" ));
+       return -1;
+   }
+
+   memset( aczWorkDate, 0x00, sizeof(aczWorkDate) );
+   memset( aczLastDate, 0x00, sizeof(aczLastDate) );
+   memset( aczNextDate, 0x00, sizeof(aczNextDate) );
+
+   /* *****FOR INFORMIX*******
+   EXEC SQL BEGIN WORK;
+   EXEC SQL SET LOCK MODE TO WAIT 5;
+   if (SQLCODE)
+   {
+       LOG4C(( LOG_FATAL, "数据库错误,SQLCODE=[%d]", SQLCODE ));
+       EXEC SQL ROLLBACK WORK;
+       return -1;
+   }
+   */
+
+   EXEC SQL DECLARE cur_trace CURSOR FOR 
+            SELECT cur_serial,work_date,last_workdate,next_date FROM sys_info WHERE 1=1 
+            FOR UPDATE OF cur_serial;
+   
+   EXEC SQL OPEN cur_trace;
+   if (SQLCODE)
+   {
+       LOG4C(( LOG_FATAL, "数据库错误,SQLCODE=[%d]", SQLCODE ));
+       /*EXEC SQL free cur_trace;*/
+       EXEC SQL ROLLBACK WORK;
+       return -1;
+   }
+
+   EXEC SQL FETCH cur_trace INTO :lCurSerial,:aczWorkDate, :aczLastDate, :aczNextDate ;
+   if (SQLCODE)
+   {
+       LOG4C(( LOG_FATAL, "数据库错误,SQLCODE=[%d]", SQLCODE ));
+       EXEC SQL CLOSE cur_trace; 
+       /*EXEC SQL free cur_trace;*/
+       EXEC SQL ROLLBACK WORK;
+       return -1;
+   }
+   LOG4C(( LOG_DEBUG, "LCURSERIAL[%d][%s]", lCurSerial, aczWorkDate ));
+   if( lCurSerial != 99999999 )
+   {
+      lNewSerial = lCurSerial + 1;
+   }
+   else
+   {
+      lNewSerial = 1;
+   }
+
+   EXEC SQL UPDATE sys_info SET cur_serial = :lNewSerial 
+        WHERE CURRENT OF cur_trace;
+
+   if (SQLCODE)
+   {
+       LOG4C(( LOG_FATAL, "数据库错误,SQLCODE=[%d]", SQLCODE ));
+       EXEC SQL CLOSE cur_trace; 
+       /*EXEC SQL free cur_trace;*/
+       EXEC SQL ROLLBACK WORK;
+       return -1;
+   }
+
+   EXEC SQL CLOSE cur_trace;
+   /*EXEC SQL free cur_trace;*/
+   EXEC SQL COMMIT WORK;
+   
+   aczWorkDate[8] = 0;
+   *oplSerial = lCurSerial;
+   strcpy( opczWorkDate, aczWorkDate );
+
+   return 0;
+}
+
+
+int DbGetAreaCode(char *MerchatId, char *TerminalId, char *AreaCode)
+{
+	return 0;
+}
+
+
+int DbGetNetOper(char *MerchatId, char *TerminalId, char *NetOper)
+{
+	return 0;
+}
+
+
+/*
+** end of file
+*/
+

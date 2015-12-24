@@ -1,0 +1,296 @@
+/**
+  * 自动冲正适配器实现文件
+  * 所有的自动冲正适配器都在此实现, 并在结构增加新增适配器引用
+  */
+
+#include <sys/time.h>
+
+#include "shm_base.h"
+#include "global.h"
+#include "log.h"
+
+EXEC SQL INCLUDE sqlca;
+EXEC SQL include "reverse/rev_fun.h";
+
+/**
+  * 以下是主机节点定义, 必须与 平台 配置中各主机节点一致
+  */
+#define ADP_SAMPLE_NODE                9999       /** ADP 冲正适配器样本 **/
+#define CMP_TELCOM_NODE                206        /** 电信主机节点 **/
+
+/**
+  * 主机节点编号定义结束
+  */
+
+ReverseRegister astRevRegister[] = {
+    { ADP_SAMPLE_NODE,               REV_AdpHost   },          /** ADP 冲正适配器样本 **/
+    { CMP_TELCOM_NODE,               REV_AxpKernel },          /** 电信主机节点 **/
+};
+
+int DataBaseConnect()
+{
+   EXEC SQL BEGIN DECLARE SECTION;
+   varchar stUsername[20];
+   varchar stPassword[20];
+   varchar stDbSid[20];
+   char stDbName[20];
+   EXEC SQL END DECLARE SECTION;
+
+   char *pczUsername=NULL;
+   char *pczPassword=NULL;
+   char *pczDbSid=NULL;
+   char *pczDbname=NULL;
+
+   if( (pczUsername=(char *)getenv("DBUSER")) == NULL )
+   {
+      LOG4C(( LOG_FATAL, "请先设置环境变量DBUSER" ));
+      return -1;
+   }
+
+   if( (pczPassword=(char *)getenv("DBPASS")) == NULL )
+   {
+      LOG4C(( LOG_FATAL, "请先设置环境变量DBPASS" ));
+      return -1;
+   }
+
+   strcpy( (char *)stUsername.arr, pczUsername );
+   strcpy( (char *)stPassword.arr, pczPassword );
+   stUsername.len = strlen( pczUsername );
+   stPassword.len = strlen( pczPassword );
+
+   if( (pczDbSid=(char *)getenv("ORACLE_ADDR")) == NULL )
+   {
+      EXEC SQL CONNECT :stUsername IDENTIFIED BY :stPassword;
+   }
+   else
+   {
+      strcpy( (char *)stDbSid.arr, pczDbSid );
+      stDbSid.len   = strlen( pczDbSid );
+      EXEC SQL CONNECT :stUsername IDENTIFIED BY :stPassword USING :stDbSid;
+   }
+
+   if( SQLCODE != 0 )
+   {
+      LOG4C(( LOG_FATAL, "Connect to database server error, sqlca.sqlcode = [%d]", SQLCODE ));
+      return SQLCODE;
+   }
+
+   /******************************FOR INFORMIX******************
+   EXEC SQL BEGIN DECLARE SECTION;
+   char *pczDatabase;
+   EXEC SQL END DECLARE SECTION;
+
+   pczDatabase = getenv( "AGENT_DB" );
+   if( pczDatabase == NULL )
+   {
+      LOG4C(( LOG_FATAL, "please set env AGENT_DB first " ));
+      return -1;
+   }
+   sqldetach();
+   EXEC SQL database :pczDatabase;
+   if( SQLCODE != 0 )
+   {
+      LOG4C(( LOG_FATAL,
+              "connect to database server error, SQLCODE = [%d]",
+              sqlca.sqlcode ));
+      return -1;
+   }
+   ******************************FOR INFORMIX******************/
+   return 0;
+}
+
+int REV_SearchSubIdBySvcIdSeq( const void *p1, const void *p2 )
+{
+   ServiceCfg *pstL = (ServiceCfg *)p1;
+   ServiceCfg *pstR = (ServiceCfg *)p2;
+
+   if( pstL->iSvcId != pstR->iSvcId )
+   {
+      return pstL->iSvcId - pstR->iSvcId;
+   }
+   return pstL->iSubSeq - pstR->iSubSeq;
+}
+
+/**
+  * 从金融明细表读记录
+  * 记录不存在已经清理过数据, 不继续冲正
+  * 
+  */
+int hasSettled( char *epczDate, int eiSerial )
+{
+   EXEC SQL BEGIN DECLARE SECTION;
+   char aczDate[9];
+   long lSerial;
+   long lBatch;
+   long lVisaBatch;
+   char aczProCode[10];
+   char aczUnitCode[10];
+   EXEC SQL END DECLARE SECTION;
+
+   lSerial = 0;
+   lBatch = 0;
+   lVisaBatch = 0;
+   memset( aczDate, 0, sizeof(aczDate) );
+   memset( aczProCode, 0, sizeof(aczProCode) );
+   memset( aczUnitCode, 0, sizeof(aczUnitCode) );
+
+   strcpy( aczDate,epczDate );
+   lSerial = eiSerial;
+   EXEC SQL select batch_no,pro_code,unit_code INTO
+                  :lBatch, :aczProCode, :aczUnitCode
+              from tx_detail
+             where pt_date=:aczDate and pt_serial=:lSerial;
+   if( SQLCODE != 0 )
+   {
+      if( SQLCODE == DATANOTFOUND )
+      {
+         return -1;
+      }
+      LOG4C(( LOG_INFO, "查询金融明细表(日期=%s 流水=%d) SQLCODE=%d",
+              aczDate, lSerial, SQLCODE ));
+      return 0;
+   }
+   
+   LOG4C(( LOG_INFO, "从签约信息表读记录(procode=%s unitcode=%s)", aczProCode, aczUnitCode ));
+
+   EXEC SQL select cur_batch into :lVisaBatch
+              from visa_info
+             where pro_code = :aczProCode and unit_code = :aczUnitCode;
+   if( SQLCODE != 0 )
+   {
+      if( SQLCODE == DATANOTFOUND )
+      {
+         return -1;
+      }
+      LOG4C(( LOG_INFO, "查询签约信息表(%s =%s) SQLCODE=%d",
+              aczProCode, aczUnitCode, SQLCODE ));
+      return 0;
+   }
+
+   LOG4C((LOG_DEBUG, "cur_batch[%d]  tx_detail_batch[%d]",  lVisaBatch, lBatch ));
+   if( lVisaBatch == lBatch )
+      return 0;
+   else /*批次号不同,表示已经开始对账*/
+      return 1;
+}
+
+int REV_RunFunction( RevRecord *pstRevRecord )
+{
+   int i, iNum, iSubId, iRet;
+   char acBasUdo[2048];
+   EXEC SQL BEGIN DECLARE SECTION;
+   long lRevSerial;
+   long lOrgAgSerial;
+   char cOrgAgDate[11];
+   EXEC SQL END DECLARE SECTION;
+
+   iNum = sizeof(astRevRegister)/sizeof(ReverseRegister);
+   LOG4C(( LOG_DEBUG, "待冲正主机节点 %d, iNum=%d, 主机id=[%d]", pstRevRecord->m_HostNodeId, iNum, pstRevRecord->m_HostNodeId ));
+   for( i = 0; i < iNum; i++ )
+   {
+      if( astRevRegister[i].m_HostId == pstRevRecord->m_HostNodeId )
+      {
+         break;
+      }
+   }
+
+   if( i == iNum )
+   {
+      LOG4C(( LOG_FATAL, "Not found host(nodeid=%d) reverse adaptor",
+             pstRevRecord->m_HostNodeId ));
+      return -1;
+   }
+
+   UDO_Init( acBasUdo, sizeof(acBasUdo) );
+   /*
+   LOG4C(( LOG_DEBUG, "udo len = %d buf = [%s]",
+           pstRevRecord->m_UdoLen, pstRevRecord->m_UdoStr ));
+   */
+   UDO_sscanf( pstRevRecord->m_UdoStr, pstRevRecord->m_UdoLen, acBasUdo );
+
+   /**
+     * 根据服务号和内部子服务序号找到冲正子服务编号
+     */
+   {
+      ServiceCfg *pstBase = NULL;
+      ServiceCfg *pstSearch = NULL;
+      ServiceCfg stSCKey;
+      int iRowNum;
+
+      stSCKey.iSvcId = pstRevRecord->m_SvcId;
+      stSCKey.iSubSeq = pstRevRecord->m_SubSeq;
+
+      pstBase = (ServiceCfg*)SHM_ReadData( (void*)pcShmAddr, SERVICECFG,
+                                           &iRowNum );
+      if( pstBase == NULL )
+      {
+         LOG4C(( LOG_FATAL, "共享内存中SERVICECFG表未定位到" ));
+         return 9998;
+      }
+      pstSearch = (ServiceCfg*)bsearch( &stSCKey, pstBase, iRowNum,
+                                        sizeof(stSCKey),
+                                        REV_SearchSubIdBySvcIdSeq );
+      if( pstSearch == NULL )
+      {
+         LOG4C(( LOG_FATAL, "冲正子服务编号未找到" ));
+         return 9998;
+      }
+      iSubId = pstSearch->iErrSubId;
+   }
+
+   if( DataBaseConnect() )
+   {
+      LOG4C(( LOG_FATAL, "打开数据库错"  ));
+      return 9999;
+   }
+
+   /* 判断, 如果正在对账或者对过, 设置强行终止 **/
+   iRet = hasSettled( pstRevRecord->m_AgDate, pstRevRecord->m_AgSerial );
+   if( iRet != 0 )
+   {
+      /* iRet == -1 说明 tx_detail 表中无记录 */
+      if( iRet == 1 )
+      {
+         LOG4C(( LOG_WARN, "交易已经对账(日期=%s 流水=%d)",
+                 pstRevRecord->m_AgDate, pstRevRecord->m_AgSerial ));
+         EXEC SQL ROLLBACK WORK RELEASE;
+         return 2;
+      }
+
+      LOG4C(( LOG_WARN, "交易在金融明细表(日期=%s 流水=%d)无数据, 请详细检查",
+              pstRevRecord->m_AgDate, pstRevRecord->m_AgSerial ));
+   }
+
+   lRevSerial = pstRevRecord->m_RevSerial;
+   LOG4C(( LOG_DEBUG, "开始调用主机节点 %d 冲正适配器 %d 冲正流水号 %d",
+           astRevRegister[i].m_HostId, i, lRevSerial ));
+   iRet = (*(astRevRegister[i].m_Function))( pstRevRecord->m_AgSerial, iSubId, acBasUdo, pstRevRecord );
+   LOG4C(( LOG_DEBUG, "主机节点 %d 冲正适配器 %d 返回值 %d",
+           astRevRegister[i].m_HostId, i, iRet ));
+
+   lOrgAgSerial = pstRevRecord->m_AgSerial;
+   strcpy( cOrgAgDate, pstRevRecord->m_AgDate );
+   PUB_StrTrim( cOrgAgDate, ' ' );
+
+   /** 如果冲正成功, 设置标志为自动冲正成功 **/
+   if( iRet == 0 )
+   {
+      /*EXEC SQL begin work;*/
+      EXEC SQL UPDATE tx_detail
+                  SET status='3'
+                WHERE pt_serial=:lOrgAgSerial and pt_date=:cOrgAgDate;
+      if( SQLCODE != 0 )
+      {
+         LOG4C(( LOG_FATAL, "更新金融明细记录(ptserial=%d,ptdate=%s)出错 SQLCODE %d",
+                 lOrgAgSerial, cOrgAgDate, SQLCODE ));
+      }
+   }
+
+   EXEC SQL COMMIT WORK RELEASE;
+
+   return iRet;
+}
+
+/**
+  * 文件结束
+  */
